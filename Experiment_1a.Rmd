@@ -1,0 +1,228 @@
+---
+output: html_document
+---
+
+```{r setup}
+study_1a_names <- c(`1` = "Control-Duration Test", `2` = "Blocked-Duration Test", `3` = "Control-F0 Test", `4` = "Blocked-F0 Test")
+study_1b_names <- c(`1` = "Stop predictive-L1 F0", `2` = "Stop predictive-L2 F0", `3` = "Stop nonpredictive-L2 F0", 
+    `4` = "Stop removed-L2 F0")
+study_1b_labels <- setNames(sub("-L", "-\nL", study_1b_names, fixed = TRUE), names(study_1b_names))
+label_1b_terms <- function(x, reference = "1", contrasts = FALSE) {
+    x <- as.character(x)
+    x <- gsub("C1_C2", paste0("mean(", study_1b_names["1"], " + ", study_1b_names["2"], ")"), x, fixed = TRUE)
+    x <- gsub("C3_C4", paste0("mean(", study_1b_names["3"], " + ", study_1b_names["4"], ")"), x, fixed = TRUE)
+    for (k in 4:1) {
+        x <- gsub(paste0("factor(condition)", k), if (contrasts) 
+            study_1b_names[as.character(k)]
+        else paste0(study_1b_names[as.character(k)], " vs. ", study_1b_names[reference]), x, fixed = TRUE)
+        x <- gsub(paste0("condition", k), if (contrasts) 
+            study_1b_names[as.character(k)]
+        else paste0(study_1b_names[as.character(k)], " vs. ", study_1b_names[reference]), x, fixed = TRUE)
+        x <- gsub(paste0("Condition ", k), study_1b_names[as.character(k)], x, fixed = TRUE)
+        x <- gsub(paste0("C", k), study_1b_names[as.character(k)], x, fixed = TRUE)
+    }
+    x <- gsub("_vs_", " vs. ", x, fixed = TRUE)
+    x <- gsub("stop_tone_alignment", "Alignment ", x, fixed = TRUE)
+    x <- gsub("Alignment Aligned", "Aligned vs. misaligned", x, fixed = TRUE)
+    x <- gsub("Alignment Misaligned", "Misaligned vs. aligned", x, fixed = TRUE)
+    x <- gsub("cue_type", "AX ", x, fixed = TRUE)
+    x <- gsub(":", " × ", x, fixed = TRUE)
+    x[x == "grouping"] <- "Nonpredictive/removed stop vs. predictive stop"
+    x
+}
+wrap_display <- function(x, width = 55) vapply(x, function(z) paste(strwrap(z, width = width), collapse = "\n"), 
+    character(1))
+study_1b_axis_labels <- setNames(sub("Stop ", "Stop\n", study_1b_labels, fixed = TRUE), names(study_1b_labels))
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+```
+
+```{r paths}
+project_dir <- Sys.getenv("ADAPT_PROJECT_DIR", ".")
+project_dir <- normalizePath(project_dir, mustWork = TRUE)
+target_dir <- file.path(project_dir, "data", "exp_1a")
+output_dir <- file.path(target_dir, "analysis")
+figure_dir <- file.path(project_dir, "Adapt", "figures_completed", "study_1a")
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+run_models <- TRUE
+run_eye_tracking <- FALSE
+data_folders <- file.path(target_dir, c("data_exp_278864-v8", "data_exp_278864-v9", "data_exp_278864-v10", "spread_data"))
+stopifnot(all(dir.exists(data_folders)))
+csv_files <- unlist(lapply(data_folders, list.files, pattern = "\\.csv$", full.names = TRUE))
+data_available <- length(csv_files) > 0
+stopifnot(data_available)
+knitr::opts_chunk$set(eval = TRUE)
+```
+
+```{r import}
+list_of_data_frames <- lapply(csv_files, function(file) {
+    read_csv(file, col_types = cols(.default = col_character()), show_col_types = FALSE) %>% mutate(source_file = basename(file))
+})
+all_data <- bind_rows(list_of_data_frames) %>% filter(!is.na(`Participant Private ID`), !is.na(`Experiment Version`))
+consent <- all_data %>% filter(grepl("questionnaire-5xbh", source_file))
+warning_page <- all_data %>% filter(grepl("questionnaire-9q6z", source_file))
+headphones <- all_data %>% filter(grepl("task-8jc2", source_file))
+et_test <- all_data %>% filter(grepl("task-d4xf", source_file))
+digit_span <- all_data %>% filter(grepl("task-2wd9", source_file))
+language_experience <- all_data %>% filter(grepl("questionnaire-zc55", source_file))
+s_exp1 <- all_data %>% filter(grepl("task-(fc2b|wjfw|719h|eqie)", source_file))
+response_events <- s_exp1 %>% filter(`Zone Type` == "response_button_image", phase %in% c("pretraining", "training", 
+    "testing")) %>% mutate(intended_response_screen = (phase %in% c("pretraining", "training") & `Screen Name` == 
+    "Screen 5") | (phase == "testing" & `Screen Name` == "Screen 4"))
+extra_response_events <- response_events %>% filter(!intended_response_screen)
+data <- response_events %>% filter(intended_response_screen) %>% mutate(participant = `Participant Private ID`, 
+    session = paste(`Experiment Version`, `Schedule ID`, sep = "_"), task = paste(`Tree Node Key`, coalesce(`Repeat Key`, 
+        ""), sep = "_"), trial = `Spreadsheet Row`, item = item_id, response = Response, answer = case_when(ANSWER == 
+        "q1" ~ q1, ANSWER == "q2" ~ q2, ANSWER == "q3" ~ q3, ANSWER == "q4" ~ q4), rt_ms = as.numeric(`Reaction Time`), 
+    trial_order = as.numeric(`Trial Number`), target_image = target, competitor_image = competitor, expected_condition = case_when(grepl("task-fc2b", 
+        source_file) ~ "1", grepl("task-wjfw", source_file) ~ "2", grepl("task-719h", source_file) ~ "3", grepl("task-eqie", 
+        source_file) ~ "4"))
+stopifnot(nrow(data) > 0, all(data$condition == data$expected_condition), all(!is.na(data$answer)), all(data$answer == 
+    data$target_image))
+duplicate_trials <- data %>% count(participant, session, task, trial) %>% filter(n > 1)
+stopifnot(nrow(duplicate_trials) == 0)
+version_counts <- data %>% group_by(`Experiment Version`, condition, phase) %>% summarise(participants = n_distinct(participant), 
+    trials = n(), .groups = "drop")
+version_counts
+participant_versions <- data %>% distinct(participant, `Experiment Version`) %>% count(participant, name = "versions") %>% 
+    filter(versions > 1)
+participant_versions
+```
+
+```{r import-outputs}
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+write_csv(version_counts, file.path(output_dir, "import_version_counts.csv"))
+```
+
+```{r participant-review}
+part_agg <- data %>% group_by(participant, condition, phase) %>% summarise(trials = n(), missing_response = sum(is.na(response) | 
+    response == ""), .groups = "drop")
+write_csv(part_agg, file.path(output_dir, "participant_trial_counts.csv"))
+rt_participant_quality <- data %>% filter(!is.na(response), response != "", is.finite(rt_ms), rt_ms > 0) %>% mutate(log_rt = log(rt_ms)) %>% 
+    group_by(participant, condition, phase) %>% summarise(median_rt_ms = median(rt_ms), median_log_rt = median(log_rt), 
+    .groups = "drop") %>% group_by(condition, phase) %>% mutate(group_median_log_rt = median(median_log_rt), group_mad_log_rt = mad(median_log_rt, 
+    constant = 1.4826), phase_rt_outlier = group_mad_log_rt > 0 & abs(median_log_rt - group_median_log_rt) > 3 * 
+    group_mad_log_rt) %>% ungroup()
+participant_rt_exclusions <- rt_participant_quality %>% group_by(participant, condition) %>% summarise(rt_outlier_phases = sum(phase_rt_outlier), 
+    rt_quality_exclude = rt_outlier_phases >= 1, .groups = "drop")
+write_csv(rt_participant_quality, file.path(output_dir, "participant_rt_quality_by_phase.csv"))
+write_csv(participant_rt_exclusions, file.path(output_dir, "participant_rt_quality_exclusions.csv"))
+review_file <- file.path(target_dir, "participant_review.csv")
+if (file.exists(review_file)) {
+    participant_review <- read_csv(review_file, show_col_types = FALSE, col_types = cols(participant = col_character(), 
+        exclude = col_logical(), reason = col_character()))
+    stopifnot(!anyDuplicated(participant_review$participant))
+    participant_review <- data %>% distinct(participant) %>% left_join(participant_review, by = "participant")
+} else {
+    participant_review <- data %>% distinct(participant) %>% mutate(exclude = FALSE, reason = "Retained: no RT-quality exclusion")
+}
+participant_review <- data %>% distinct(participant) %>% left_join(participant_review, by = "participant") %>% 
+    left_join(participant_rt_exclusions %>% select(participant, rt_outlier_phases, rt_quality_exclude), by = "participant") %>% 
+    mutate(rt_outlier_phases = coalesce(rt_outlier_phases, 0L), rt_quality_exclude = coalesce(rt_quality_exclude, 
+        FALSE), exclude = coalesce(exclude, FALSE) | rt_quality_exclude, reason = case_when(rt_quality_exclude ~ 
+        "RT-quality exclusion: median log-RT exceeded 3 scaled MADs in at least one phase", is.na(reason) | reason == 
+        "" | reason == "CHECK HERE" ~ "Retained: no RT-quality exclusion", TRUE ~ reason))
+stopifnot(all(!participant_review$exclude | (!is.na(participant_review$reason) & participant_review$reason != "")))
+part_keep <- participant_review %>% filter(!exclude)
+removal <- data %>% distinct(participant, condition) %>% left_join(participant_review, by = "participant") %>% 
+    count(condition, exclude, reason, name = "participants")
+write_csv(removal, file.path(output_dir, "participant_removal.csv"))
+expected_trials <- c(pretraining = 48L, training = 48L, testing = 32L)
+participant_audit <- part_agg %>% mutate(expected_trials = unname(expected_trials[phase]), complete = trials == 
+    expected_trials) %>% group_by(condition, phase, expected_trials) %>% summarise(participants = n_distinct(participant), 
+    min_trials = min(trials), max_trials = max(trials), missing_responses = sum(missing_response), all_complete = all(complete), 
+    .groups = "drop")
+item_audit <- data %>% filter(participant %in% part_keep$participant) %>% group_by(condition, phase, item) %>% 
+    summarise(trials = n(), participants = n_distinct(participant), .groups = "drop") %>% group_by(condition, phase) %>% 
+    summarise(items = n_distinct(item), min_item_trials = min(trials), max_item_trials = max(trials), balanced_items = min_item_trials == 
+        max_item_trials, .groups = "drop")
+stopifnot(all(participant_audit$all_complete), all(participant_audit$missing_responses == 0), all(item_audit$items == 
+    4), all(item_audit$balanced_items))
+write_csv(participant_audit, file.path(output_dir, "participant_completeness_audit.csv"))
+write_csv(item_audit, file.path(output_dir, "item_balance_audit.csv"))
+```
+
+```{r behavioral-cleanup}
+mad_standard <- 3
+data_cleaned <- data %>% filter(participant %in% part_keep$participant) %>% mutate(missing_response = is.na(response) | 
+    response == "", missing_answer = is.na(answer) | answer == "", correct = if_else(missing_response | missing_answer, 
+    NA_integer_, as.integer(response == answer)), log_rt = if_else(is.finite(rt_ms) & rt_ms > 0, log(pmax(rt_ms, 
+    0.001)), NA_real_))
+accuracy_data <- data_cleaned %>% filter(!is.na(correct))
+rt_data <- accuracy_data %>% filter(correct == 1, is.finite(log_rt), rt_ms > 0) %>% group_by(participant, task, 
+    phase) %>% mutate(median_rt = median(log_rt), abs_distance = abs(log_rt - median_rt), median_distance = median(abs_distance), 
+    rt_outlier = if_else(n() >= 5 & median_distance > 0, abs_distance > mad_standard * median_distance, FALSE)) %>% 
+    ungroup()
+write_csv(rt_data %>% select(participant, session, task, trial, rt_ms, rt_outlier), file.path(output_dir, "rt_screening.csv"))
+rt_data <- rt_data %>% filter(!rt_outlier)
+trial_removal <- data_cleaned %>% group_by(condition, phase) %>% summarise(total = n(), missing_response = sum(missing_response), 
+    missing_answer = sum(missing_answer), accuracy_retained = sum(!is.na(correct)), .groups = "drop")
+write_csv(trial_removal, file.path(output_dir, "trial_retention.csv"))
+write_csv(accuracy_data, file.path(output_dir, "accuracy_data.csv"))
+```
+
+```{r design}
+condition_key <- tibble(condition = as.character(1:4), blocking = c("control", "blocked", "control", "blocked"), 
+    tested_cue = c("duration", "duration", "f0", "f0"))
+stopifnot(all(accuracy_data$condition %in% condition_key$condition))
+test_data <- accuracy_data %>% filter(phase == "testing") %>% select(-any_of(c("blocking", "tested_cue"))) %>% 
+    left_join(condition_key, by = "condition") %>% mutate(blocking = factor(blocking, levels = c("control", "blocked")), 
+    tested_cue = factor(tested_cue, levels = c("duration", "f0")))
+```
+
+```{r model-selection}
+library(lme4)
+library(emmeans)
+random_rhs <- c(maximal_correlated = "(1 | participant) + (1 + blocking * tested_cue | item)", main_slopes_correlated = "(1 | participant) + (1 + blocking + tested_cue | item)", 
+    main_slopes_uncorrelated = "(1 | participant) + (1 | item) + (0 + blocking | item) + (0 + tested_cue | item)", 
+    blocking_slope_only = "(1 | participant) + (1 | item) + (0 + blocking | item)", cue_slope_only = "(1 | participant) + (1 | item) + (0 + tested_cue | item)", 
+    random_intercepts = "(1 | participant) + (1 | item)")
+fit_glmer_candidate <- function(fixed_rhs, random_rhs, data) {
+    warnings <- character()
+    fit <- withCallingHandlers(tryCatch(glmer(as.formula(paste("correct ~", fixed_rhs, "+", random_rhs)), family = binomial, 
+        data = data, control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e+05))), error = function(e) e), 
+        warning = function(w) {
+            warnings <<- c(warnings, conditionMessage(w))
+            invokeRestart("muffleWarning")
+        })
+    list(fit = fit, warnings = unique(warnings))
+}
+random_fits <- lapply(random_rhs, function(rhs) fit_glmer_candidate("blocking * tested_cue", rhs, test_data))
+random_selection <- tibble(candidate = names(random_rhs), random_effects = unname(random_rhs), fitted = vapply(random_fits, 
+    function(x) inherits(x$fit, "merMod"), logical(1)), converged = vapply(random_fits, function(x) inherits(x$fit, 
+    "merMod") && length(x$fit@optinfo$conv$lme4$messages %||% character()) == 0, logical(1)), singular = vapply(random_fits, 
+    function(x) inherits(x$fit, "merMod") && isSingular(x$fit), logical(1)), AIC = vapply(random_fits, function(x) if (inherits(x$fit, 
+    "merMod")) AIC(x$fit) else NA_real_, numeric(1)), BIC = vapply(random_fits, function(x) if (inherits(x$fit, 
+    "merMod")) BIC(x$fit) else NA_real_, numeric(1)), diagnostic = vapply(random_fits, function(x) {
+    if (!inherits(x$fit, "merMod")) 
+        return(conditionMessage(x$fit))
+    paste(c(x$warnings, x$fit@optinfo$conv$lme4$messages %||% character()), collapse = "; ")
+}, character(1))) %>% mutate(eligible = fitted & converged & !singular)
+if (!any(random_selection$eligible)) {
+    stop("No converged, non-singular random-effects candidate was available.")
+}
+selected_random_name <- random_selection %>% filter(eligible) %>% slice_min(AIC, n = 1, with_ties = FALSE) %>% 
+    pull(candidate)
+selected_random_rhs <- unname(random_rhs[[selected_random_name]])
+selected_random_model <- random_fits[[selected_random_name]]$fit
+random_selection <- random_selection %>% mutate(selected_random_model = candidate == selected_random_name, status = case_when(!fitted ~ 
+    "fit failed", !converged ~ "not converged", singular ~ "singular", TRUE ~ "eligible"), delta_AIC = if_else(eligible, 
+    AIC - min(AIC[eligible]), NA_real_), delta_BIC = if_else(eligible, BIC - min(BIC[eligible]), NA_real_))
+write_csv(random_selection, file.path(output_dir, "test_random_effects_selection.csv"))
+mod_test_full <- fit_glmer_candidate("blocking * tested_cue", selected_random_rhs, test_data)$fit
+selected_model <- mod_test_full
+selected_model_name <- "blocking × tested_cue"
+summary(selected_model)
+isSingular(selected_model)
+selected_model@optinfo$conv$lme4$messages
+test_model_terms <- as.data.frame(summary(selected_model)$coefficients) %>% tibble::rownames_to_column("term")
+test_estimates <- emmeans(selected_model, ~blocking | tested_cue)
+test_estimates_out <- as.data.frame(summary(test_estimates, type = "response", infer = TRUE))
+test_contrasts <- as.data.frame(summary(pairs(regrid(test_estimates), reverse = TRUE, adjust = "holm"), infer = TRUE))
+write_csv(test_model_terms, file.path(output_dir, "test_accuracy_model_coefficients.csv"))
+write_csv(test_estimates_out, file.path(output_dir, "test_accuracy_estimates.csv"))
+write_csv(test_contrasts, file.path(output_dir, "test_accuracy_blocking_contrasts.csv"))
+```

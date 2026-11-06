@@ -1,0 +1,928 @@
+---
+output: html_document
+---
+
+```{r setup}
+study_1a_names <- c(`1` = "Control-Duration Test", `2` = "Blocked-Duration Test", `3` = "Control-F0 Test", `4` = "Blocked-F0 Test")
+study_1b_names <- c(`1` = "Stop predictive-L1 F0", `2` = "Stop predictive-L2 F0", `3` = "Stop nonpredictive-L2 F0", 
+    `4` = "Stop removed-L2 F0")
+study_1b_labels <- setNames(sub("-L", "-\nL", study_1b_names, fixed = TRUE), names(study_1b_names))
+label_1b_terms <- function(x, reference = "1", contrasts = FALSE) {
+    x <- as.character(x)
+    x <- gsub("C1_C2", paste0("mean(", study_1b_names["1"], " + ", study_1b_names["2"], ")"), x, fixed = TRUE)
+    x <- gsub("C3_C4", paste0("mean(", study_1b_names["3"], " + ", study_1b_names["4"], ")"), x, fixed = TRUE)
+    for (k in 4:1) {
+        x <- gsub(paste0("factor(condition)", k), if (contrasts) 
+            study_1b_names[as.character(k)]
+        else paste0(study_1b_names[as.character(k)], " vs. ", study_1b_names[reference]), x, fixed = TRUE)
+        x <- gsub(paste0("condition", k), if (contrasts) 
+            study_1b_names[as.character(k)]
+        else paste0(study_1b_names[as.character(k)], " vs. ", study_1b_names[reference]), x, fixed = TRUE)
+        x <- gsub(paste0("Condition ", k), study_1b_names[as.character(k)], x, fixed = TRUE)
+        x <- gsub(paste0("C", k), study_1b_names[as.character(k)], x, fixed = TRUE)
+    }
+    x <- gsub("_vs_", " vs. ", x, fixed = TRUE)
+    x <- gsub("stop_tone_alignment", "Alignment ", x, fixed = TRUE)
+    x <- gsub("Alignment Aligned", "Aligned vs. misaligned", x, fixed = TRUE)
+    x <- gsub("Alignment Misaligned", "Misaligned vs. aligned", x, fixed = TRUE)
+    x <- gsub("cue_type", "AX ", x, fixed = TRUE)
+    x <- gsub(":", " × ", x, fixed = TRUE)
+    x[x == "grouping"] <- "Nonpredictive/removed stop vs. predictive stop"
+    x
+}
+wrap_display <- function(x, width = 55) vapply(x, function(z) paste(strwrap(z, width = width), collapse = "\n"), 
+    character(1))
+study_1b_axis_labels <- setNames(sub("Stop ", "Stop\n", study_1b_labels, fixed = TRUE), names(study_1b_labels))
+knitr::opts_chunk$set(echo = TRUE, error = FALSE)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+```
+
+```{r paths}
+project_dir <- Sys.getenv("ADAPT_PROJECT_DIR", ".")
+project_dir <- normalizePath(project_dir, mustWork = TRUE)
+target_dir <- file.path(project_dir, "data", "exp_1b")
+output_dir <- file.path(target_dir, "analysis")
+figure_dir <- file.path(project_dir, "Adapt", "figures_completed", "study_1b")
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+run_models <- TRUE
+run_eye_tracking <- FALSE
+export_roots <- c(target_dir, file.path(project_dir, "data", "exp_2"))
+data_folders <- unlist(lapply(export_roots, list.dirs, recursive = FALSE, full.names = TRUE))
+data_folders <- data_folders[grepl("^data_exp_278863-v[0-9]+$", basename(data_folders))]
+stopifnot(!anyDuplicated(basename(data_folders)))
+folder_csv_files <- unlist(lapply(data_folders, list.files, pattern = "\\.csv$", full.names = TRUE))
+spread_directories <- file.path(target_dir, c("spread_data_5", "spread_data"))
+spread_csv_files <- unlist(lapply(spread_directories, function(directory) {
+    if (dir.exists(directory)) 
+        list.files(directory, pattern = "^data_exp_278863-v[0-9]+_.*[.]csv$", full.names = TRUE)
+    else character()
+}))
+import_files <- tibble(path = c(spread_csv_files, folder_csv_files)) %>% mutate(source_file = basename(path), selected = !duplicated(source_file))
+csv_files <- import_files$path[import_files$selected]
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+write_csv(import_files, file.path(output_dir, "import_file_selection.csv"))
+raw_data_available <- length(csv_files) > 0
+data_available <- FALSE
+ax_raw <- tibble()
+ax <- tibble()
+```
+
+```{r raw-import}
+all_data <- tibble()
+if (raw_data_available) {
+    list_of_data_frames <- lapply(csv_files, function(file) {
+        read_csv(file, col_types = cols(.default = col_character()), show_col_types = FALSE) %>% mutate(source_file = basename(file))
+    })
+    all_data <- bind_rows(list_of_data_frames) %>% filter(!is.na(`Participant Private ID`), !is.na(`Experiment Version`))
+} else {
+    message("Waiting for Gorilla CSVs in extracted export folders or spread_data under: ", target_dir)
+}
+```
+
+```{r task-import}
+if (raw_data_available) {
+    consent <- all_data %>% filter(grepl("questionnaire-5xbh", source_file))
+    warning_page <- all_data %>% filter(grepl("questionnaire-9q6z", source_file))
+    headphones <- all_data %>% filter(grepl("task-8jc2", source_file))
+    et_test <- all_data %>% filter(grepl("task-d4xf", source_file))
+    digit_span <- all_data %>% filter(grepl("task-2wd9", source_file))
+    language_experience <- all_data %>% filter(grepl("questionnaire-zc55", source_file))
+    ax_instructions <- all_data %>% filter(grepl("task-(sr8v|n7re)", source_file))
+    s_exp1b <- all_data %>% filter(grepl("task-(fc2b|wjfw|719h|eqie|ci5b|qhmu|o6s4|kosn)", source_file))
+    ax_raw <- all_data %>% filter(condition %in% c("list_tone", "list_tone_stopless", "list_VOT"))
+    event_inventory <- s_exp1b %>% count(`Tree Node Key`, display, `Screen Name`, `Zone Type`)
+    response_events <- s_exp1b %>% filter(`Screen Name` == "Screen 3", display %in% c("practice", "testing"), `Zone Type` %in% 
+        c("response_button_image", "timelimit_screen"))
+    data <- response_events %>% mutate(participant = `Participant Private ID`, session = paste(`Experiment Version`, 
+        `Schedule ID`, sep = "_"), task = paste(`Tree Node Key`, coalesce(`Repeat Key`, ""), sep = "_"), trial = `Spreadsheet Row`, 
+        item = item_id, response = if_else(`Zone Type` == "timelimit_screen", NA_character_, Response), answer = case_when(ANSWER == 
+            "q1" ~ q1, ANSWER == "q2" ~ q2, ANSWER == "q3" ~ q3, ANSWER == "q4" ~ q4), target_image = target, competitor_image = competitor, 
+        rt_ms = as.numeric(`Reaction Time`), trial_order = as.numeric(`Trial Number`), condition = condition_number, 
+        expected_condition = case_when(grepl("task-(fc2b|ci5b)", source_file) ~ "1", grepl("task-(wjfw|qhmu)", 
+            source_file) ~ "2", grepl("task-(719h|o6s4)", source_file) ~ "3", grepl("task-(eqie|kosn)", source_file) ~ 
+            "4"), phase = if_else(display == "practice", "training", "testing"), phase = factor(phase, levels = c("training", 
+            "testing"), ordered = TRUE))
+    stopifnot(nrow(data) > 0, all(data$condition == data$expected_condition), all(data$answer == data$target), 
+        !anyNA(data$item))
+    condition_key <- data %>% distinct(participant, `Experiment Version`, condition)
+    stopifnot(!anyDuplicated(condition_key[c("participant", "Experiment Version")]))
+    ax <- ax_raw %>% filter(display == "trial", `Screen Name` == "Screen 3", `Zone Type` %in% c("response_keyboard", 
+        "timelimit_screen", "continue_button")) %>% mutate(participant = `Participant Private ID`, session = paste(`Experiment Version`, 
+        `Schedule ID`, sep = "_"), task = paste(`Tree Node Key`, coalesce(`Repeat Key`, ""), sep = "_"), trial = `Spreadsheet Row`, 
+        response = if_else(`Zone Type` != "response_keyboard", NA_character_, tolower(Response)), answer = case_when(tolower(ANSWER) %in% 
+            c("same", "z") ~ "z", tolower(ANSWER) %in% c("different", "m") ~ "m"), rt_ms = as.numeric(`Reaction Time`), 
+        occasion = "post", ax_list = condition, cue_type = case_when(ax_list == "list_tone" ~ "F0 intact", ax_list == 
+            "list_tone_stopless" ~ "F0 stopless", ax_list == "list_VOT" ~ "VOT"), cue_type = factor(cue_type, levels = c("F0 intact", 
+            "F0 stopless", "VOT"))) %>% select(-condition) %>% left_join(condition_key, by = c("participant", "Experiment Version"))
+    stopifnot(!anyNA(ax$condition), !anyNA(ax$answer), !anyNA(ax$cue_type))
+    data_available <- TRUE
+}
+knitr::opts_chunk$set(eval = data_available)
+```
+
+```{r import-checks}
+stopifnot(all(c("participant", "session", "task", "trial", "item", "phase", "condition", "language", "response", 
+    "answer", "rt_ms", "trial_order") %in% names(data)))
+duplicate_trials <- data %>% count(participant, session, task, trial) %>% filter(n > 1)
+stopifnot(nrow(duplicate_trials) == 0, !anyNA(data$answer), !anyNA(data$phase))
+version_counts <- data %>% group_by(`Experiment Version`, condition, phase) %>% summarise(participants = n_distinct(participant), 
+    trials = n(), .groups = "drop")
+version_counts
+if (interactive()) View(version_counts)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+write_csv(version_counts, file.path(output_dir, "import_version_counts.csv"))
+write_csv(event_inventory, file.path(output_dir, "event_inventory.csv"))
+completion <- data %>% group_by(participant, condition, phase) %>% summarise(trials = n(), omissions = sum(is.na(response)), 
+    .groups = "drop") %>% mutate(expected = if_else(phase == "training", 144L, 64L), complete = trials == expected)
+write_csv(completion, file.path(output_dir, "completion_checks.csv"))
+unique(completion$participant)
+if (interactive()) View(completion)
+library(tidyr)
+length(unique(completion$participant))
+```
+
+```{r participant-review}
+part_agg <- data %>% group_by(participant, condition, phase) %>% summarise(trials = n(), missing_response = sum(is.na(response) | 
+    response == ""), .groups = "drop")
+write_csv(part_agg, file.path(output_dir, "participant_trial_counts.csv"))
+rt_participant_quality <- data %>% filter(!is.na(response), response != "", is.finite(rt_ms), rt_ms > 0) %>% mutate(log_rt = log(rt_ms)) %>% 
+    group_by(participant, condition, phase) %>% summarise(median_rt_ms = median(rt_ms), median_log_rt = median(log_rt), 
+    .groups = "drop") %>% group_by(condition, phase) %>% mutate(group_median_log_rt = median(median_log_rt), group_mad_log_rt = mad(median_log_rt, 
+    constant = 1.4826), phase_rt_outlier = group_mad_log_rt > 0 & abs(median_log_rt - group_median_log_rt) > 3 * 
+    group_mad_log_rt) %>% ungroup()
+participant_rt_exclusions <- rt_participant_quality %>% group_by(participant, condition) %>% summarise(rt_outlier_phases = sum(phase_rt_outlier), 
+    rt_quality_exclude = rt_outlier_phases >= 1, .groups = "drop")
+write_csv(rt_participant_quality, file.path(output_dir, "participant_rt_quality_by_phase.csv"))
+write_csv(participant_rt_exclusions, file.path(output_dir, "participant_rt_quality_exclusions.csv"))
+review_file <- file.path(target_dir, "participant_review.csv")
+if (file.exists(review_file)) {
+    participant_review <- read_csv(review_file, show_col_types = FALSE, col_types = cols(participant = col_character(), 
+        exclude = col_logical(), reason = col_character()))
+    stopifnot(!anyDuplicated(participant_review$participant))
+    participant_review <- data %>% distinct(participant) %>% left_join(participant_review, by = "participant")
+} else {
+    participant_review <- data %>% distinct(participant) %>% mutate(exclude = FALSE, reason = "Retained: no RT-quality exclusion")
+}
+participant_review <- data %>% distinct(participant) %>% left_join(participant_review, by = "participant") %>% 
+    left_join(participant_rt_exclusions %>% select(participant, rt_outlier_phases, rt_quality_exclude), by = "participant") %>% 
+    mutate(rt_outlier_phases = coalesce(rt_outlier_phases, 0L), rt_quality_exclude = coalesce(rt_quality_exclude, 
+        FALSE), exclude = coalesce(exclude, FALSE) | rt_quality_exclude, reason = case_when(rt_quality_exclude ~ 
+        paste0("RT-quality exclusion: median log-RT beyond 3 scaled MADs in either training or testing", if_else(!is.na(reason) & 
+            !reason %in% c("", "CHECK HERE", "Retained: no RT-quality exclusion"), paste0("; existing review: ", 
+            reason), "")), is.na(reason) | reason == "" | reason == "CHECK HERE" ~ "Retained: no RT-quality exclusion", 
+        TRUE ~ reason))
+stopifnot(all(!participant_review$exclude | (!is.na(participant_review$reason) & participant_review$reason != "")))
+part_keep <- participant_review %>% filter(!exclude)
+removal <- data %>% distinct(participant, condition) %>% left_join(participant_review, by = "participant") %>% 
+    count(condition, exclude, reason, name = "participants")
+write_csv(removal, file.path(output_dir, "participant_removal.csv"))
+participant_retention_counts <- data %>% distinct(participant, condition) %>% left_join(participant_review, by = "participant") %>% 
+    group_by(condition) %>% summarise(before = n(), rt_excluded = sum(rt_quality_exclude), excluded = sum(exclude), 
+    retained = sum(!exclude), .groups = "drop")
+write_csv(participant_review, file.path(output_dir, "participant_review_applied.csv"))
+write_csv(participant_retention_counts, file.path(output_dir, "participant_retention_counts.csv"))
+if (file.exists(file.path(output_dir, "participant_review_to_complete.csv"))) file.remove(file.path(output_dir, 
+    "participant_review_to_complete.csv"))
+```
+
+```{r participant-demographics}
+recruitment_counts <- tibble(consent_export_participants = n_distinct(consent$`Participant Private ID`), behavioral_participants = n_distinct(data$participant), 
+    excluded_participants = sum(participant_review$exclude), retained_participants = n_distinct(part_keep$participant))
+age_records <- language_experience %>% filter(grepl("^My age:", Question), Key == "value") %>% transmute(participant = `Participant Private ID`, 
+    age = suppressWarnings(as.numeric(Response))) %>% filter(is.finite(age)) %>% distinct(participant, age)
+age_conflicts <- age_records %>% count(participant) %>% filter(n > 1L)
+stopifnot(nrow(age_conflicts) == 0L)
+participant_demographics <- data %>% distinct(participant, condition) %>% left_join(participant_review %>% select(participant, 
+    exclude), by = "participant") %>% left_join(age_records, by = "participant")
+age_summary <- bind_rows(participant_demographics %>% mutate(sample = "Before exclusions"), participant_demographics %>% 
+    filter(!exclude) %>% mutate(sample = "Retained")) %>% group_by(sample) %>% summarise(participants = n(), age_n = sum(!is.na(age)), 
+    age_missing = sum(is.na(age)), age_min = if (all(is.na(age))) NA_real_ else min(age, na.rm = TRUE), age_max = if (all(is.na(age))) NA_real_ else max(age, 
+        na.rm = TRUE), age_mean = if (all(is.na(age))) NA_real_ else mean(age, na.rm = TRUE), age_sd = sd(age, 
+        na.rm = TRUE), .groups = "drop")
+write_csv(recruitment_counts, file.path(output_dir, "recruitment_counts.csv"))
+write_csv(age_summary, file.path(output_dir, "age_summary.csv"))
+```
+
+```{r behavioral-cleanup}
+mad_standard <- 3
+data_cleaned <- data %>% filter(participant %in% part_keep$participant) %>% mutate(missing_response = is.na(response) | 
+    response == "", missing_answer = is.na(answer) | answer == "", correct = if_else(missing_response | missing_answer, 
+    NA_integer_, as.integer(response == answer)), log_rt = if_else(is.finite(rt_ms) & rt_ms > 0, log(pmax(rt_ms, 
+    0.001)), NA_real_))
+accuracy_data <- data_cleaned %>% filter(!is.na(correct))
+rt_data <- accuracy_data %>% filter(correct == 1, is.finite(log_rt), rt_ms > 0) %>% group_by(participant, task, 
+    phase) %>% mutate(median_rt = median(log_rt), abs_distance = abs(log_rt - median_rt), median_distance = median(abs_distance), 
+    rt_outlier = if_else(n() >= 5 & median_distance > 0, abs_distance > mad_standard * median_distance, FALSE)) %>% 
+    ungroup()
+write_csv(rt_data %>% select(participant, session, task, trial, rt_ms, rt_outlier), file.path(output_dir, "rt_screening.csv"))
+rt_data <- rt_data %>% filter(!rt_outlier)
+trial_removal <- data_cleaned %>% group_by(condition, phase) %>% summarise(total = n(), missing_response = sum(missing_response), 
+    missing_answer = sum(missing_answer), accuracy_retained = sum(!is.na(correct)), .groups = "drop")
+write_csv(trial_removal, file.path(output_dir, "trial_retention.csv"))
+write_csv(accuracy_data, file.path(output_dir, "accuracy_data.csv"))
+```
+
+```{r condition-naming-key}
+```
+
+```{r descriptive-checks}
+condition_labels <- study_1b_labels
+condition_colors <- c(`1` = "#0072B2", `2` = "#D55E00", `3` = "#009E73", `4` = "#CC79A7")
+accuracy_data <- accuracy_data %>% mutate(condition = factor(condition, levels = as.character(1:4)))
+pilot_key <- data %>% distinct(participant) %>% arrange(participant) %>% mutate(pilot = paste0("P", row_number()))
+part_agg <- accuracy_data %>% group_by(participant, condition, phase) %>% summarise(score = mean(correct), trials = n(), 
+    .groups = "drop") %>% left_join(pilot_key, by = "participant")
+write_csv(part_agg, file.path(output_dir, "participant_accuracy.csv"))
+learning_part <- accuracy_data %>% mutate(trial_bin = floor((trial_order - 1)/8) * 8 + 1) %>% group_by(participant, 
+    condition, phase, trial_bin) %>% summarise(score = mean(correct), trials = n(), .groups = "drop") %>% left_join(pilot_key, 
+    by = "participant")
+learning_agg <- learning_part %>% group_by(condition, phase, trial_bin) %>% summarise(score = mean(score), participants = n(), 
+    .groups = "drop")
+item_agg <- accuracy_data %>% group_by(item, condition, phase) %>% summarise(score = mean(correct), trials = n(), 
+    .groups = "drop")
+test_alignment <- data_cleaned %>% filter(phase == "testing") %>% mutate(original_target_file = sub("^.*__([bp][a-z]+_[13]_[0-9]+)__.*$", 
+    "\\1", audio_file), source_word = sub("_[0-9]+$", "", original_target_file), source_stop = substr(source_word, 
+    1, 1), source_tone = sub("^.*_", "", source_word), stop_tone_alignment = case_when(source_stop == "b" & source_tone == 
+    "3" ~ "Aligned", source_stop == "p" & source_tone == "1" ~ "Aligned", source_stop == "b" & source_tone == "1" ~ 
+    "Misaligned", source_stop == "p" & source_tone == "3" ~ "Misaligned"), stop_tone_alignment = factor(stop_tone_alignment, 
+    levels = c("Aligned", "Misaligned")))
+stopifnot(!anyNA(test_alignment$stop_tone_alignment), all(test_alignment$source_word == test_alignment$word))
+alignment_key <- test_alignment %>% distinct(original_target_file, source_word, source_stop, source_tone, stop_tone_alignment)
+stopifnot(!anyDuplicated(alignment_key$original_target_file))
+alignment_counts <- test_alignment %>% group_by(participant, condition, stop_tone_alignment) %>% summarise(trials = n(), 
+    responses = sum(!missing_response), omissions = sum(missing_response), .groups = "drop")
+test_by_alignment <- test_alignment %>% filter(!missing_response) %>% group_by(participant, condition, stop_tone_alignment) %>% 
+    summarise(score = mean(correct), trials = n(), .groups = "drop")
+alignment_average <- test_by_alignment %>% group_by(condition, stop_tone_alignment) %>% summarise(score = mean(score), 
+    participants = n(), .groups = "drop")
+write_csv(alignment_key, file.path(output_dir, "test_stop_tone_alignment_key.csv"))
+write_csv(alignment_counts, file.path(output_dir, "test_stop_tone_alignment_counts.csv"))
+write_csv(test_by_alignment, file.path(output_dir, "test_stop_tone_alignment_participants.csv"))
+write_csv(alignment_average, file.path(output_dir, "test_stop_tone_alignment_means.csv"))
+```
+
+```{r ax-scoring}
+ax_available <- nrow(ax) > 0
+ax_scores <- tibble()
+if (ax_available) {
+    ax <- ax %>% mutate(participant = as.character(participant), condition = as.character(condition)) %>% filter(participant %in% 
+        part_keep$participant)
+    stopifnot(!anyDuplicated(ax[c("participant", "session", "task", "trial")]), all(ax$answer %in% c("z", "m")))
+    ax <- ax %>% mutate(missing_ax_response = !response %in% c("z", "m"), too_fast = !missing_ax_response & is.finite(rt_ms) & 
+        rt_ms < 0, invalid_rt = !missing_ax_response & (!is.finite(rt_ms) | rt_ms > 1500), usable = !missing_ax_response & 
+        is.finite(rt_ms) & rt_ms >= 0 & rt_ms <= 1500, hit = usable & answer == "m" & response == "m", false_alarm = usable & 
+        answer == "z" & response == "m")
+    ax_scores <- ax %>% group_by(participant, condition, language, cue_type, occasion) %>% summarise(total = n(), 
+        omissions = sum(missing_ax_response), too_fast = sum(too_fast), invalid_rt = sum(invalid_rt), excluded = sum(!usable), 
+        n_different = sum(usable & answer == "m"), n_same = sum(usable & answer == "z"), hits = sum(hit), false_alarms = sum(false_alarm), 
+        .groups = "drop") %>% mutate(hit_rate = (hits + 0.5)/(n_different + 1), fa_rate = (false_alarms + 0.5)/(n_same + 
+        1), dprime = if_else(n_different > 0 & n_same > 0, qnorm(hit_rate) - qnorm(fa_rate), NA_real_), bias = if_else(n_different > 
+        0 & n_same > 0, -0.5 * (qnorm(hit_rate) + qnorm(fa_rate)), NA_real_))
+    stopifnot(all(ax_scores$total == ax_scores$n_same + ax_scores$n_different + ax_scores$excluded), all(ax_scores$excluded == 
+        ax_scores$omissions + ax_scores$too_fast + ax_scores$invalid_rt))
+    write_csv(ax %>% select(participant, condition, cue_type, session, task, trial, response, answer, rt_ms, missing_ax_response, 
+        too_fast, invalid_rt, usable), file.path(output_dir, "ax_trial_screening.csv"))
+    write_csv(ax_scores, file.path(output_dir, "ax_sensitivity.csv"))
+    ax_accuracy <- ax %>% group_by(participant, condition, cue_type) %>% summarise(trials = n(), omissions = sum(missing_ax_response), 
+        too_fast = sum(too_fast), invalid_rt = sum(invalid_rt), excluded = sum(!usable), accuracy = if (any(usable)) 
+            mean(response[usable] == answer[usable])
+        else NA_real_, .groups = "drop")
+    write_csv(ax_accuracy, file.path(output_dir, "ax_accuracy.csv"))
+    ax_limits <- range(c(0, ax_scores$dprime), na.rm = TRUE)
+    for (cue in levels(ax$cue_type)) {
+    }
+    ax_inventory <- ax %>% group_by(`Experiment Version`, `Tree Node Key`, ax_list, cue_type) %>% summarise(participants = n_distinct(participant), 
+        trials = n(), omissions = sum(missing_ax_response), too_fast = sum(too_fast), invalid_rt = sum(invalid_rt), 
+        excluded = sum(!usable), .groups = "drop")
+    write_csv(ax_inventory, file.path(output_dir, "ax_task_inventory.csv"))
+}
+```
+
+```{r lexical-cue-analysis}
+stop_key <- data %>% filter(phase == "training", condition %in% c("1", "2")) %>% mutate(base_word = sub("_[0-9]+.*$", 
+    "", word), frame = substring(base_word, 2), stop = substring(base_word, 1, 1)) %>% distinct(participant, `Experiment Version`, 
+    condition, frame, stop, stop_image = target_image)
+stopifnot(!anyDuplicated(stop_key[c("participant", "Experiment Version", "condition", "frame", "stop")]))
+test_cues <- data_cleaned %>% filter(phase == "testing") %>% mutate(condition = as.character(condition), base_word = sub("_[0-9]+.*$", 
+    "", word), frame = substring(base_word, 2), stop = substring(base_word, 1, 1), tone_image = target_image) %>% 
+    left_join(stop_key, by = c("participant", "Experiment Version", "condition", "frame", "stop")) %>% mutate(cue_relation = case_when(condition %in% 
+    c("3", "4") ~ "No trained stop mapping", tone_image == stop_image ~ "Matching", tone_image != stop_image ~ 
+    "Conflicting"), tone_consistent = if_else(missing_response, NA_integer_, as.integer(response == tone_image)), 
+    stop_consistent = if_else(missing_response | is.na(stop_image), NA_integer_, as.integer(response == stop_image)), 
+    response_choice = case_when(missing_response ~ "Omission", cue_relation == "Matching" & tone_consistent == 
+        1L ~ "Both cues", tone_consistent == 1L ~ "Tone", stop_consistent == 1L ~ "Stop", TRUE ~ "Other picture")) %>% 
+    left_join(pilot_key, by = "participant")
+stopifnot(!anyNA(test_cues$cue_relation), all(!is.na(test_cues$stop_image[test_cues$condition %in% c("1", "2")])), 
+    all(test_cues$stop_image[test_cues$cue_relation == "Conflicting"] == test_cues$competitor_image[test_cues$cue_relation == 
+        "Conflicting"]))
+stopifnot(all(with(test_cues %>% filter(condition %in% c("1", "2")), (cue_relation == "Matching") == (congruent == 
+    "congruent"))))
+cue_trial_counts <- test_cues %>% group_by(participant, pilot, condition, cue_relation) %>% summarise(trials = n(), 
+    omissions = sum(missing_response), .groups = "drop")
+write_csv(cue_trial_counts, file.path(output_dir, "cue_trial_counts.csv"))
+write_csv(test_cues, file.path(output_dir, "test_cue_responses.csv"))
+cue_mapping <- test_cues %>% distinct(condition, word, tone_image, stop_image, cue_relation) %>% arrange(condition, 
+    word)
+write_csv(cue_mapping, file.path(output_dir, "test_cue_mapping.csv"))
+tone_part <- test_cues %>% group_by(participant, pilot, condition, cue_relation) %>% summarise(trials = n(), responses = sum(!missing_response), 
+    tone_proportion = if (any(!missing_response)) mean(tone_consistent, na.rm = TRUE) else NA_real_, .groups = "drop")
+choice_levels <- c("Both cues", "Tone", "Stop", "Other picture")
+choice_part <- test_cues %>% filter(condition %in% c("1", "2"), !missing_response) %>% mutate(response_choice = factor(response_choice, 
+    levels = choice_levels)) %>% group_by(participant, pilot, condition, cue_relation) %>% count(response_choice, 
+    .drop = FALSE, name = "choices") %>% mutate(proportion = choices/sum(choices)) %>% ungroup()
+choice_agg <- choice_part %>% group_by(condition, cue_relation, response_choice) %>% summarise(proportion = mean(proportion), 
+    participants = n_distinct(participant), .groups = "drop")
+choice_colors <- c(`Both cues` = "#777777", Tone = "#009E73", Stop = "#E69F00", `Other picture` = "#9999CC")
+write_csv(tone_part, file.path(output_dir, "test_tone_proportions.csv"))
+write_csv(choice_part, file.path(output_dir, "test_participant_cue_choices.csv"))
+write_csv(choice_agg, file.path(output_dir, "test_condition_cue_choices.csv"))
+```
+
+```{r design}
+test_data <- test_cues %>% filter(!missing_response) %>% mutate(condition = factor(condition, levels = c("1", "2", 
+    "3", "4")))
+```
+
+```{r model-setup}
+library(lme4)
+library(emmeans)
+stopifnot(all(c("tone_consistent", "stop_consistent", "cue_relation") %in% names(test_data)), all(test_data$tone_consistent %in% 
+    c(0, 1)))
+```
+
+```{r overall-tone-model}
+test_data <- test_data %>% mutate(c3 = as.numeric(condition == "3"), c4 = as.numeric(condition == "4"))
+mod_tone <- glmer(tone_consistent ~ condition + (1 | participant) + (0 + c3 | item) + (0 + c4 | item), family = binomial, 
+    data = test_data, control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e+05)))
+tone_estimates <- emmeans(mod_tone, ~condition)
+tone_estimates_out <- summary(tone_estimates, type = "response", infer = TRUE)
+tone_contrasts <- contrast(tone_estimates, list(C2_vs_C3_C4 = c(0, 1, -0.5, -0.5), C3_vs_C4 = c(0, 0, 1, -1)), 
+    adjust = "holm")
+tone_contrasts_out <- summary(tone_contrasts, infer = TRUE)
+write_csv(as.data.frame(tone_estimates_out), file.path(output_dir, "tone_model_estimates.csv"))
+write_csv(as.data.frame(tone_contrasts_out), file.path(output_dir, "tone_model_contrasts.csv"))
+```
+
+```{r alignment-model}
+alignment_model_data <- test_alignment %>% filter(!missing_response) %>% mutate(condition = factor(condition, levels = c("1", 
+    "2", "3", "4")))
+alignment_model_data <- alignment_model_data %>% mutate(a = as.numeric(stop_tone_alignment == "Misaligned") - 0.5, 
+    c2 = as.numeric(condition == "2"), c3 = as.numeric(condition == "3"), c4 = as.numeric(condition == "4"))
+mod_alignment <- glmer(correct ~ condition * stop_tone_alignment + (1 + a || participant) + (1 + c2 + c3 + c4 + 
+    a + c3:a + c4:a || item), family = binomial, data = alignment_model_data, control = glmerControl(optimizer = "bobyqa", 
+    optCtrl = list(maxfun = 2e+05)))
+mod_alignment_additive <- update(mod_alignment, . ~ . - condition:stop_tone_alignment)
+alignment_interaction_test <- anova(mod_alignment_additive, mod_alignment, test = "Chisq")
+alignment_estimates <- emmeans(mod_alignment, ~condition | stop_tone_alignment)
+alignment_estimates_out <- summary(alignment_estimates, type = "response", infer = TRUE)
+write_csv(as.data.frame(alignment_interaction_test), file.path(output_dir, "alignment_model_interaction_test.csv"))
+```
+
+```{r alignment-comparison-setup}
+alignment_c1_contrasts <- contrast(alignment_estimates, list(C2_vs_C1 = c(-1, 1, 0, 0), C3_vs_C1 = c(-1, 0, 1, 
+    0), C4_vs_C1 = c(-1, 0, 0, 1), C3_vs_C2 = c(0, -1, 1, 0)), by = "stop_tone_alignment")
+alignment_c1_out <- as.data.frame(summary(alignment_c1_contrasts, by = NULL, infer = c(FALSE, TRUE), adjust = "holm")) %>% 
+    mutate(odds_ratio = exp(estimate))
+write_csv(alignment_c1_out, file.path(output_dir, "alignment_C1_reference_contrasts.csv"))
+write_csv(as.data.frame(alignment_estimates_out), file.path(output_dir, "alignment_model_estimates.csv"))
+```
+
+```{r aligned-results}
+aligned_estimates <- as.data.frame(alignment_estimates_out) %>% filter(stop_tone_alignment == "Aligned")
+aligned_comparisons <- alignment_c1_out %>% filter(stop_tone_alignment == "Aligned")
+```
+
+```{r misaligned-results}
+misaligned_estimates <- as.data.frame(alignment_estimates_out) %>% filter(stop_tone_alignment == "Misaligned")
+misaligned_comparisons <- alignment_c1_out %>% filter(stop_tone_alignment == "Misaligned")
+```
+
+```{r supplementary-alignment}
+misaligned_contrasts <- contrast(alignment_estimates, list(C3_vs_C1_C2 = c(-0.5, -0.5, 1, 0), C4_vs_C1_C2 = c(-0.5, 
+    -0.5, 0, 1), C3_vs_C4 = c(0, 0, 1, -1)), by = "stop_tone_alignment", adjust = "holm")
+misaligned_contrasts_out <- summary(misaligned_contrasts, infer = TRUE)
+write_csv(as.data.frame(misaligned_contrasts_out), file.path(output_dir, "alignment_model_contrasts.csv"))
+```
+
+```{r rq12-model-selection-setup}
+rq12_fit <- function(d, label) {
+    d <- d %>% mutate(condition = droplevels(factor(condition)), stop_tone_alignment = factor(stop_tone_alignment, 
+        levels = c("Misaligned", "Aligned")), participant = factor(participant), item = factor(item), a = as.numeric(stop_tone_alignment == 
+        "Aligned"))
+    stopifnot(!anyNA(d), all(d$correct %in% 0:1))
+    stopifnot(all(tapply(d$condition, d$participant, function(x) n_distinct(x)) == 1), all(tapply(d$a, d$participant, 
+        function(x) n_distinct(x)) == 2), all(tapply(d$condition, d$item, function(x) n_distinct(x)) == nlevels(d$condition)), 
+        all(tapply(d$a, d$item, function(x) n_distinct(x)) == 2))
+    slopes <- paste0("c", levels(d$condition)[-1])
+    for (j in seq_along(slopes)) d[[slopes[j]]] <- as.numeric(d$condition == levels(d$condition)[j + 1])
+    main <- paste(c(slopes, "a"), collapse = "+")
+    full <- paste(c(slopes, "a", paste0(slopes, ":a")), collapse = "+")
+    rhs <- c(maximal_correlated = paste0("(1+a|participant)+(1+", full, "|item)"), maximal_independent = paste0("(1+a||participant)+(1+", 
+        full, "||item)"), main_slopes_correlated = paste0("(1+a|participant)+(1+", main, "|item)"), main_slopes_independent = paste0("(1+a||participant)+(1+", 
+        main, "||item)"), condition_item_slopes = paste0("(1+a||participant)+(1+", paste(slopes, collapse = "+"), 
+        "||item)"), alignment_slopes = "(1+a||participant)+(1+a||item)", participant_alignment = "(1+a||participant)+(1|item)", 
+        random_intercepts = "(1|participant)+(1|item)")
+    fits <- list()
+    rows <- list()
+    for (nm in names(rhs)) {
+        formula <- as.formula(paste("correct~condition*stop_tone_alignment+", rhs[[nm]]))
+        key <- list(data = as.data.frame(d), formula = paste(deparse(formula), collapse = ""), optimizer = "bobyqa", 
+            maxfun = 2e+05, nAGQ = 1, lme4 = as.character(packageVersion("lme4")))
+        cache <- file.path(output_dir, paste0(label, "_candidate_", nm, ".rds"))
+        previous <- if (file.exists(cache)) 
+            readRDS(cache)
+        else NULL
+        if (!is.null(previous) && identical(previous$key, key)) 
+            result <- previous$result
+        else {
+            message(label, ": fitting ", nm)
+            warnings <- character()
+            fit <- withCallingHandlers(tryCatch(glmer(formula, data = d, family = binomial, control = glmerControl(optimizer = "bobyqa", 
+                optCtrl = list(maxfun = 2e+05))), error = function(e) e), warning = function(w) {
+                warnings <<- c(warnings, conditionMessage(w))
+                invokeRestart("muffleWarning")
+            })
+            result <- list(fit = fit, warnings = unique(warnings))
+            saveRDS(list(key = key, result = result), cache)
+        }
+        fit <- result$fit
+        fitted <- inherits(fit, "merMod")
+        conv <- if (fitted) 
+            fit@optinfo$conv$lme4$messages
+        else character()
+        convergence_issues <- conv[!grepl("boundary (singular) fit", conv, fixed = TRUE)]
+        converged <- fitted && length(convergence_issues) == 0 && all(fit@optinfo$conv$opt == 0)
+        fits[[nm]] <- fit
+        rows[[nm]] <- tibble(candidate = nm, random_effects = rhs[[nm]], fitted = fitted, converged = converged, 
+            singular = if (fitted) 
+                isSingular(fit)
+            else NA, AIC = if (fitted) 
+                AIC(fit)
+            else NA_real_, BIC = if (fitted) 
+                BIC(fit)
+            else NA_real_, diagnostic = if (fitted) 
+                paste(c(result$warnings, conv), collapse = "; ")
+            else conditionMessage(fit))
+        write_csv(bind_rows(rows), file.path(output_dir, paste0(label, "_random_effects_selection.csv")))
+    }
+    selection <- bind_rows(rows) %>% mutate(eligible = fitted & converged & !singular)
+    if (!any(selection$eligible)) 
+        stop(label, ": no converged nonsingular candidate; inspect diagnostics.")
+    selected <- selection %>% filter(eligible) %>% slice_min(AIC, n = 1, with_ties = FALSE) %>% pull(candidate)
+    selection <- selection %>% mutate(selected = candidate == selected, delta_AIC = if_else(eligible, AIC - min(AIC[eligible]), 
+        NA_real_))
+    model <- fits[[selected]]
+    write_csv(selection, file.path(output_dir, paste0(label, "_random_effects_selection.csv")))
+    saveRDS(model, file.path(output_dir, paste0(label, "_model.rds")))
+    list(model = model, selection = selection)
+}
+```
+
+```{r rq1-blocking}
+rq1_data <- test_alignment %>% filter(!missing_response, !is.na(correct)) %>% select(participant, item, condition, 
+    stop_tone_alignment, correct)
+rq1_fit <- rq12_fit(rq1_data, "rq1")
+mod_rq1 <- rq1_fit$model
+rq1_results <- as.data.frame(coef(summary(mod_rq1))) %>% tibble::rownames_to_column("term")
+write_csv(rq1_results, file.path(output_dir, "rq1_blocking.csv"))
+```
+
+```{r rq1-c2-reference}
+rq1_c2_data <- model.frame(mod_rq1)
+rq1_c2_data$condition <- relevel(rq1_c2_data$condition, ref = "2")
+contrasts(rq1_c2_data$condition) <- contr.treatment(levels(rq1_c2_data$condition), base = 1)
+mod_rq1_c2 <- update(mod_rq1, data = rq1_c2_data)
+rq1_c2_check <- data.frame(observations_original = nobs(mod_rq1), observations_c2 = nobs(mod_rq1_c2), logLik_original = as.numeric(logLik(mod_rq1)), 
+    logLik_c2 = as.numeric(logLik(mod_rq1_c2)), max_fitted_difference = max(abs(fitted(mod_rq1) - fitted(mod_rq1_c2))), 
+    singular = isSingular(mod_rq1_c2), convergence = paste(mod_rq1_c2@optinfo$conv$lme4$messages, collapse = "; "))
+stopifnot(nobs(mod_rq1) == nobs(mod_rq1_c2), abs(as.numeric(logLik(mod_rq1) - logLik(mod_rq1_c2))) < 0.01, rq1_c2_check$max_fitted_difference < 
+    0.001)
+rq1_c2_results <- as.data.frame(coef(summary(mod_rq1_c2))) %>% tibble::rownames_to_column("term") %>% mutate(lower_95 = Estimate - 
+    qnorm(0.975) * `Std. Error`, upper_95 = Estimate + qnorm(0.975) * `Std. Error`)
+write_csv(rq1_c2_results, file.path(output_dir, "rq1_c2_blocking.csv"))
+write_csv(rq1_c2_check, file.path(output_dir, "rq1_c2_fit_check.csv"))
+saveRDS(mod_rq1_c2, file.path(output_dir, "rq1_c2_model.rds"))
+```
+
+```{r rq2-stop-competition}
+rq2_data <- rq1_data %>% filter(condition %in% c("3", "4"))
+rq2_fit <- rq12_fit(rq2_data, "rq2")
+mod_rq2 <- rq2_fit$model
+rq2_results <- as.data.frame(coef(summary(mod_rq2))) %>% tibble::rownames_to_column("term")
+write_csv(rq2_results, file.path(output_dir, "rq2_stop_competition.csv"))
+```
+
+```{r rq3-information-data}
+rq3_info_path <- file.path(output_dir, "rq3_training_information_k2_snapshot.csv")
+rq3_info <- read_csv(rq3_info_path, show_col_types = FALSE) %>% filter(k == 2, metric %in% c("F0 alone", "VOT alone", 
+    "Shared information (net)")) %>% mutate(condition = as.character(condition), metric = recode(metric, `F0 alone` = "f0_info", 
+    `VOT alone` = "vot_info", `Shared information (net)` = "shared_info")) %>% select(condition, vowel_family, 
+    metric, estimate_bits) %>% pivot_wider(names_from = metric, values_from = estimate_bits)
+stopifnot(nrow(rq3_info) == 16, !anyDuplicated(rq3_info[c("condition", "vowel_family")]))
+rq3_scaling <- tibble(variable = c("f0_info", "vot_info", "shared_info")) %>% mutate(center = sapply(variable, 
+    function(x) mean(rq3_info[[x]])), scale = sapply(variable, function(x) sd(rq3_info[[x]])))
+for (x in rq3_scaling$variable) rq3_info[[paste0(x, "_z")]] <- (rq3_info[[x]] - rq3_scaling$center[rq3_scaling$variable == 
+    x])/rq3_scaling$scale[rq3_scaling$variable == x]
+rq3_data <- test_alignment %>% filter(stop_tone_alignment == "Misaligned", !missing_response, !is.na(correct)) %>% 
+    transmute(participant = factor(participant), item = factor(item), condition = as.character(condition), correct = as.integer(correct), 
+        vowel_family = substring(sub("_.*$", "", source_word), 2)) %>% left_join(rq3_info, by = c("condition", 
+    "vowel_family"), relationship = "many-to-one") %>% mutate(condition = factor(condition, levels = 1:4), vowel_family = factor(vowel_family), 
+    grouping = as.numeric(condition %in% c("3", "4")), c2 = as.numeric(condition == "2"), c3 = as.numeric(condition == 
+        "3"), c4 = as.numeric(condition == "4"), v2 = as.numeric(vowel_family == levels(vowel_family)[2]), v3 = as.numeric(vowel_family == 
+        levels(vowel_family)[3]), v4 = as.numeric(vowel_family == levels(vowel_family)[4]))
+stopifnot(!anyNA(rq3_data), all(rq3_data$correct %in% 0:1), nrow(rq3_data) == sum(model.frame(mod_rq1)$stop_tone_alignment == 
+    "Misaligned"))
+rq3_cells <- rq3_data %>% distinct(condition, vowel_family, f0_info_z, vot_info_z, shared_info_z)
+rq3_x <- model.matrix(~vowel_family + f0_info_z + vot_info_z + shared_info_z, rq3_cells)
+stopifnot(qr(rq3_x)$rank == ncol(rq3_x))
+rq3_vif <- bind_rows(lapply(c("f0_info_z", "vot_info_z", "shared_info_z"), function(x) {
+    rhs <- setdiff(c("vowel_family", "f0_info_z", "vot_info_z", "shared_info_z"), x)
+    tibble(predictor = x, VIF = 1/(1 - summary(lm(reformulate(rhs, response = x), data = rq3_cells))$r.squared))
+}))
+write_csv(rq3_data, file.path(output_dir, "rq3_information_model_data.csv"))
+write_csv(rq3_scaling, file.path(output_dir, "rq3_information_scaling.csv"))
+write_csv(rq3_vif, file.path(output_dir, "rq3_information_collinearity.csv"))
+```
+
+```{r rq3-information-simplification}
+rq3_fixed <- c(Information = "vowel_family+f0_info_z+vot_info_z+shared_info_z", Grouping = "vowel_family+grouping", 
+    Categorical = "vowel_family+condition")
+rq3_random <- c(maximal = "(1+v2+v3+v4|participant)+(1+c2+c3+c4|item)", independent = "(1+v2+v3+v4||participant)+(1+c2+c3+c4||item)", 
+    participant_slopes = "(1+v2+v3+v4||participant)+(1|item)", item_slopes = "(1|participant)+(1+c2+c3+c4||item)", 
+    intercepts = "(1|participant)+(1|item)")
+rq3_selection <- tibble()
+rq3_all_models <- list()
+for (candidate in names(rq3_random)) for (profile in names(rq3_fixed)) {
+    f <- as.formula(paste("correct~", rq3_fixed[[profile]], "+", rq3_random[[candidate]]))
+    key <- list(data = as.data.frame(rq3_data), formula = paste(deparse(f), collapse = ""), maxfun = 2e+05, optimizer = "bobyqa", 
+        lme4 = as.character(packageVersion("lme4")))
+    path <- file.path(output_dir, paste0("rq3_info_candidate_", candidate, "_", profile, ".rds"))
+    old <- if (file.exists(path)) 
+        readRDS(path)
+    else NULL
+    if (!is.null(old) && identical(key, old$key)) 
+        result <- old$result
+    else {
+        warnings <- character()
+        fit <- withCallingHandlers(tryCatch(glmer(f, data = rq3_data, family = binomial, control = glmerControl(optimizer = "bobyqa", 
+            optCtrl = list(maxfun = 2e+05))), error = function(e) e), warning = function(w) {
+            warnings <<- c(warnings, conditionMessage(w))
+            invokeRestart("muffleWarning")
+        })
+        result <- list(fit = fit, warnings = unique(warnings))
+        saveRDS(list(key = key, result = result), path)
+    }
+    m <- result$fit
+    fitted <- inherits(m, "merMod")
+    msg <- if (fitted) 
+        m@optinfo$conv$lme4$messages
+    else character()
+    issues <- msg[!grepl("boundary (singular) fit", msg, fixed = TRUE)]
+    converged <- fitted && length(issues) == 0 && all(m@optinfo$conv$opt == 0)
+    singular <- if (fitted) 
+        isSingular(m)
+    else NA
+    rq3_selection <- bind_rows(rq3_selection, tibble(candidate = candidate, profile = profile, random_effects = rq3_random[[candidate]], 
+        converged = converged, singular = singular, eligible = fitted && converged && !singular, AIC = if (fitted) 
+            AIC(m)
+        else NA_real_, diagnostic = if (fitted) 
+            paste(c(result$warnings, msg), collapse = "; ")
+        else conditionMessage(m)))
+    rq3_all_models[[paste(candidate, profile)]] <- m
+    write_csv(rq3_selection, file.path(output_dir, "rq3_information_random_selection.csv"))
+}
+rq3_eligible <- rq3_selection %>% group_by(candidate) %>% filter(all(eligible)) %>% filter(profile == "Information") %>% 
+    ungroup() %>% arrange(AIC)
+if (nrow(rq3_eligible) == 0) stop("No common converged nonsingular RQ3 structure; inspect audit.")
+rq3_selected_structure <- rq3_eligible$candidate[1]
+rq3_models <- setNames(lapply(names(rq3_fixed), function(x) rq3_all_models[[paste(rq3_selected_structure, x)]]), 
+    names(rq3_fixed))
+rq3_selection <- rq3_selection %>% mutate(selected = candidate == rq3_selected_structure)
+for (m in rq3_models) stopifnot(!isSingular(m), identical(getME(m, "y"), getME(rq3_models$Information, "y")), identical(getME(m, 
+    "Zt"), getME(rq3_models$Information, "Zt")))
+write_csv(rq3_selection, file.path(output_dir, "rq3_information_random_selection.csv"))
+saveRDS(rq3_models, file.path(output_dir, "rq3_information_models.rds"))
+```
+
+```{r rq3-information-output}
+write_csv(as.data.frame(coef(summary(rq3_models$Information))) %>% tibble::rownames_to_column("term"), file.path(output_dir, 
+    "rq3_information_information_coefficients.csv"))
+```
+
+```{r rq3-grouping-output}
+write_csv(as.data.frame(coef(summary(rq3_models$Grouping))) %>% tibble::rownames_to_column("term"), file.path(output_dir, 
+    "rq3_information_grouping_coefficients.csv"))
+```
+
+```{r rq3-categorical-output}
+write_csv(as.data.frame(coef(summary(rq3_models$Categorical))) %>% tibble::rownames_to_column("term"), file.path(output_dir, 
+    "rq3_information_categorical_coefficients.csv"))
+```
+
+```{r rq3-information-comparison}
+rq3_fit <- tibble(model = names(rq3_models), n = sapply(rq3_models, nobs), parameters = sapply(rq3_models, function(m) attr(logLik(m), 
+    "df")), AIC = sapply(rq3_models, AIC), BIC = sapply(rq3_models, BIC)) %>% mutate(delta_AIC = AIC - min(AIC), 
+    delta_BIC = BIC - min(BIC))
+write_csv(rq3_fit, file.path(output_dir, "rq3_information_model_comparison.csv"))
+```
+
+```{r rq3-grouping-likelihood-test}
+rq3_grouping_test <- anova(rq3_models$Grouping, rq3_models$Categorical, test = "Chisq")
+write_csv(as.data.frame(rq3_grouping_test) %>% tibble::rownames_to_column("model"), file.path(output_dir, "rq3_information_grouping_lrt.csv"))
+```
+
+```{r rq3-information-predictions}
+rq3_grid <- rq3_data %>% group_by(condition, vowel_family) %>% slice_head(n = 1) %>% ungroup()
+rq3_predictions <- bind_rows(lapply(names(rq3_models), function(nm) {
+    m <- rq3_models[[nm]]
+    X <- model.matrix(delete.response(terms(lme4::nobars(formula(m)))), rq3_grid)
+    X <- X[, names(fixef(m)), drop = FALSE]
+    eta <- as.numeric(X %*% fixef(m))
+    se <- sqrt(rowSums((X %*% as.matrix(vcov(m))) * X))
+    tibble(model = nm, condition = rq3_grid$condition, vowel_family = rq3_grid$vowel_family, probability = plogis(eta), 
+        lower = plogis(eta - 1.96 * se), upper = plogis(eta + 1.96 * se))
+}))
+write_csv(rq3_predictions, file.path(output_dir, "rq3_information_predictions.csv"))
+```
+
+```{r rq3-combined-design}
+rq3_combined_fixed <- "f0_info_z+vot_info_z+shared_info_z+grouping"
+rq3_combined_x <- model.matrix(as.formula(paste("~", rq3_combined_fixed)), rq3_data)
+stopifnot(qr(rq3_combined_x)$rank == ncol(rq3_combined_x))
+rq3_combined_cells <- rq3_data %>% distinct(condition, vowel_family, f0_info_z, vot_info_z, shared_info_z, grouping)
+rq3_combined_vif <- bind_rows(lapply(c("f0_info_z", "vot_info_z", "shared_info_z", "grouping"), function(x) {
+    rhs <- setdiff(c("f0_info_z", "vot_info_z", "shared_info_z", "grouping"), x)
+    tibble(predictor = x, VIF = 1/(1 - summary(lm(reformulate(rhs, response = x), data = rq3_combined_cells))$r.squared))
+}))
+write_csv(rq3_combined_vif, file.path(output_dir, "rq3_combined_collinearity.csv"))
+```
+
+```{r rq3-combined-simplification}
+rq3_combined_random <- c(maximal_family = "(1+v2+v3+v4|participant)+(1+c2+c3+c4|item)+(1|vowel_family)", independent_family = "(1+v2+v3+v4||participant)+(1+c2+c3+c4||item)+(1|vowel_family)", 
+    participant_family = "(1+v2+v3+v4||participant)+(1|item)+(1|vowel_family)", item_family = "(1|participant)+(1+c2+c3+c4||item)+(1|vowel_family)", 
+    intercepts_family = "(1|participant)+(1|item)+(1|vowel_family)", maximal_item = "(1+v2+v3+v4|participant)+(1+c2+c3+c4|item)", 
+    independent_item = "(1+v2+v3+v4||participant)+(1+c2+c3+c4||item)", participant_item = "(1+v2+v3+v4||participant)+(1|item)", 
+    item_slopes = "(1|participant)+(1+c2+c3+c4||item)", intercepts = "(1|participant)+(1|item)")
+rq3_combined_selection <- tibble()
+rq3_combined_fits <- list()
+for (candidate in names(rq3_combined_random)) {
+    f <- as.formula(paste("correct~", rq3_combined_fixed, "+", rq3_combined_random[[candidate]]))
+    key <- list(data = as.data.frame(rq3_data), formula = paste(deparse(f), collapse = ""), optimizer = "bobyqa", 
+        maxfun = 2e+05, lme4 = as.character(packageVersion("lme4")))
+    path <- file.path(output_dir, paste0("rq3_combined_candidate_", candidate, ".rds"))
+    old <- if (file.exists(path)) 
+        readRDS(path)
+    else NULL
+    if (!is.null(old) && identical(old$key, key)) 
+        result <- old$result
+    else {
+        warnings <- character()
+        fit <- withCallingHandlers(tryCatch(glmer(f, data = rq3_data, family = binomial, control = glmerControl(optimizer = "bobyqa", 
+            optCtrl = list(maxfun = 2e+05))), error = function(e) e), warning = function(w) {
+            warnings <<- c(warnings, conditionMessage(w))
+            invokeRestart("muffleWarning")
+        })
+        result <- list(fit = fit, warnings = unique(warnings))
+        saveRDS(list(key = key, result = result), path)
+    }
+    m <- result$fit
+    fitted <- inherits(m, "merMod")
+    msg <- if (fitted) 
+        m@optinfo$conv$lme4$messages
+    else character()
+    issues <- msg[!grepl("boundary (singular) fit", msg, fixed = TRUE)]
+    converged <- fitted && length(issues) == 0 && all(m@optinfo$conv$opt == 0)
+    singular <- if (fitted) 
+        isSingular(m)
+    else NA
+    rq3_combined_selection <- bind_rows(rq3_combined_selection, tibble(candidate = candidate, random_effects = rq3_combined_random[[candidate]], 
+        converged = converged, singular = singular, eligible = fitted && converged && !singular, AIC = if (fitted) 
+            AIC(m)
+        else NA_real_, diagnostic = if (fitted) 
+            paste(c(result$warnings, msg), collapse = "; ")
+        else conditionMessage(m)))
+    rq3_combined_fits[[candidate]] <- m
+    write_csv(rq3_combined_selection, file.path(output_dir, "rq3_combined_random_selection.csv"))
+}
+rq3_combined_eligible <- rq3_combined_selection %>% filter(eligible) %>% arrange(AIC)
+if (nrow(rq3_combined_eligible) == 0) stop("Combined RQ3 has no converged nonsingular candidate.")
+rq3_combined_selected <- rq3_combined_eligible$candidate[1]
+mod_rq3_combined <- rq3_combined_fits[[rq3_combined_selected]]
+rq3_combined_selection <- rq3_combined_selection %>% mutate(selected = candidate == rq3_combined_selected)
+write_csv(rq3_combined_selection, file.path(output_dir, "rq3_combined_random_selection.csv"))
+saveRDS(mod_rq3_combined, file.path(output_dir, "rq3_combined_model.rds"))
+```
+
+```{r rq3-combined-output}
+rq3_combined_results <- as.data.frame(coef(summary(mod_rq3_combined))) %>% tibble::rownames_to_column("term")
+write_csv(rq3_combined_results, file.path(output_dir, "rq3_combined_coefficients.csv"))
+```
+
+```{r rq4-random-selection-setup}
+rq4_select <- function(d, fixed, candidates, label) {
+    stopifnot(!anyNA(d), !anyDuplicated(d[c("participant", "cue_type")]))
+    audit <- tibble()
+    fits <- list()
+    for (candidate in names(candidates)) {
+        f <- as.formula(paste("dprime~", fixed, "+", candidates[[candidate]]))
+        key <- list(data = as.data.frame(d), formula = paste(deparse(f), collapse = ""), REML = FALSE, optimizer = "bobyqa", 
+            maxfun = 2e+05, lme4 = as.character(packageVersion("lme4")))
+        path <- file.path(output_dir, paste0(label, "_candidate_", candidate, ".rds"))
+        old <- if (file.exists(path)) 
+            readRDS(path)
+        else NULL
+        if (!is.null(old) && identical(old$key, key)) 
+            result <- old$result
+        else {
+            warnings <- character()
+            fit <- withCallingHandlers(tryCatch(lmer(f, data = d, REML = FALSE, control = lmerControl(optimizer = "bobyqa", 
+                optCtrl = list(maxfun = 2e+05))), error = function(e) e), warning = function(w) {
+                warnings <<- c(warnings, conditionMessage(w))
+                invokeRestart("muffleWarning")
+            })
+            result <- list(fit = fit, warnings = unique(warnings))
+            saveRDS(list(key = key, result = result), path)
+        }
+        m <- result$fit
+        fitted <- inherits(m, "merMod")
+        msg <- if (fitted) 
+            m@optinfo$conv$lme4$messages
+        else character()
+        issues <- msg[!grepl("boundary (singular) fit", msg, fixed = TRUE)]
+        converged <- fitted && length(issues) == 0 && all(m@optinfo$conv$opt == 0)
+        singular <- if (fitted) 
+            isSingular(m)
+        else NA
+        audit <- bind_rows(audit, tibble(candidate = candidate, random_effects = candidates[[candidate]], converged = converged, 
+            singular = singular, eligible = fitted && converged && !singular, AIC = if (fitted) 
+                AIC(m)
+            else NA_real_, diagnostic = if (fitted) 
+                paste(c(result$warnings, msg), collapse = "; ")
+            else conditionMessage(m)))
+        fits[[candidate]] <- m
+    }
+    eligible <- audit %>% filter(eligible) %>% arrange(AIC)
+    if (nrow(eligible) == 0) 
+        stop(paste(label, "has no converged nonsingular candidate"))
+    selected <- eligible$candidate[1]
+    model <- fits[[selected]]
+    audit$selected <- audit$candidate == eligible$candidate[1]
+    write_csv(audit, file.path(output_dir, paste0(label, "_random_selection.csv")))
+    saveRDS(model, file.path(output_dir, paste0(label, "_model.rds")))
+    list(model = model, selection = audit)
+}
+rq4a_candidates <- c(correlated_vot = "(1+vot|participant)+(0+stopless|participant)", correlated_stopless = "(1+stopless|participant)+(0+vot|participant)", 
+    correlated_slopes = "(1|participant)+(0+stopless+vot|participant)", independent = "(1+stopless+vot||participant)", 
+    vot_only = "(1+vot||participant)", stopless_only = "(1+stopless||participant)", intercept = "(1|participant)")
+rq4b_candidates <- c(independent = "(1+stopless||participant)", intercept = "(1|participant)")
+```
+
+```{r rq4-combined-model}
+rq4_tone_use <- alignment_model_data %>% filter(stop_tone_alignment == "Misaligned") %>% group_by(participant) %>% 
+    summarise(misaligned_tone = mean(correct), lexical_trials = n(), .groups = "drop")
+rq4_combined_data <- ax_scores %>% left_join(rq4_tone_use, by = "participant") %>% filter(is.finite(dprime), is.finite(misaligned_tone)) %>% 
+    mutate(participant = factor(participant), condition = factor(condition, levels = as.character(1:4)), cue_type = factor(cue_type, 
+        levels = c("F0 intact", "F0 stopless", "VOT")))
+rq4_combined_center <- rq4_combined_data %>% distinct(participant, misaligned_tone) %>% summarise(center = mean(misaligned_tone)) %>% 
+    pull(center)
+rq4_combined_data <- rq4_combined_data %>% mutate(tone_centered = misaligned_tone - rq4_combined_center, stopless = as.numeric(cue_type == 
+    "F0 stopless"), vot = as.numeric(cue_type == "VOT"))
+rq4_combined_fit <- rq4_select(rq4_combined_data %>% select(participant, condition, cue_type, dprime, tone_centered, 
+    stopless, vot), "condition*cue_type+tone_centered*cue_type", rq4a_candidates, "rq4_combined")
+mod_rq4_combined <- rq4_combined_fit$model
+mod_rq4 <- mod_rq4_combined
+saveRDS(mod_rq4, file.path(output_dir, "rq4_primary_model.rds"))
+write_csv(rq4_combined_fit$selection, file.path(output_dir, "rq4_primary_random_selection.csv"))
+rq4_combined_counts <- rq4_combined_data %>% count(condition, cue_type, name = "participants")
+write_csv(rq4_combined_data, file.path(output_dir, "rq4_combined_data.csv"))
+write_csv(rq4_combined_counts, file.path(output_dir, "rq4_combined_counts.csv"))
+```
+
+```{r rq4-combined-coefficients}
+rq4_term_labels <- c(`(Intercept)` = "Baseline AX sensitivity", condition2 = "Condition 2 vs. Condition 1", condition3 = "Condition 3 vs. Condition 1", 
+    condition4 = "Condition 4 vs. Condition 1", `cue_typeF0 stopless` = "F0 stopless vs. F0 intact", cue_typeVOT = "VOT vs. F0 intact", 
+    tone_centered = "Lexical tone use (F0 intact)", `condition2:cue_typeF0 stopless` = "C2 vs. C1 × F0 stopless vs. intact", 
+    `condition3:cue_typeF0 stopless` = "C3 vs. C1 × F0 stopless vs. intact", `condition4:cue_typeF0 stopless` = "C4 vs. C1 × F0 stopless vs. intact", 
+    `condition2:cue_typeVOT` = "C2 vs. C1 × VOT vs. F0 intact", `condition3:cue_typeVOT` = "C3 vs. C1 × VOT vs. F0 intact", 
+    `condition4:cue_typeVOT` = "C4 vs. C1 × VOT vs. F0 intact", `cue_typeF0 stopless:tone_centered` = "Lexical tone use × F0 stopless vs. intact", 
+    `cue_typeVOT:tone_centered` = "Lexical tone use × VOT vs. F0 intact")
+rq4_term_labels <- setNames(wrap_display(label_1b_terms(rq4_term_labels)), names(rq4_term_labels))
+stopifnot(setequal(names(fixef(mod_rq4_combined)), names(rq4_term_labels)))
+rq4_primary_coefficients <- as.data.frame(coef(summary(mod_rq4_combined))) %>% mutate(term = rownames(.), label = unname(rq4_term_labels[term]), 
+    z = Estimate/`Std. Error`, p = 2 * pnorm(-abs(z)), lower = Estimate - qnorm(0.975) * `Std. Error`, upper = Estimate + 
+        qnorm(0.975) * `Std. Error`)
+write_csv(rq4_primary_coefficients, file.path(output_dir, "rq4_primary_coefficients.csv"))
+```
+
+```{r rq4-combined-output}
+rq4_combined_slopes <- as.data.frame(summary(emtrends(mod_rq4_combined, ~cue_type, var = "tone_centered", lmer.df = "asymptotic"), 
+    infer = c(TRUE, TRUE), adjust = "holm")) %>% mutate(stars = case_when(p.value < 0.001 ~ "***", p.value < 0.01 ~ 
+    "**", p.value < 0.05 ~ "*", TRUE ~ "ns"))
+rq4_combined_grid <- rq4_combined_data %>% group_by(condition, cue_type) %>% summarise(misaligned_tone = list(seq(min(misaligned_tone), 
+    max(misaligned_tone), length.out = 100)), .groups = "drop") %>% unnest(misaligned_tone) %>% mutate(tone_centered = misaligned_tone - 
+    rq4_combined_center)
+rq4_combined_X <- model.matrix(delete.response(terms(lme4::nobars(formula(mod_rq4_combined)))), rq4_combined_grid, 
+    contrasts.arg = attr(getME(mod_rq4_combined, "X"), "contrasts"))
+rq4_combined_grid$estimate <- as.vector(rq4_combined_X %*% fixef(mod_rq4_combined))
+rq4_combined_grid$SE <- sqrt(rowSums((rq4_combined_X %*% as.matrix(vcov(mod_rq4_combined))) * rq4_combined_X))
+rq4_combined_grid <- rq4_combined_grid %>% mutate(lower = estimate - qnorm(0.975) * SE, upper = estimate + qnorm(0.975) * 
+    SE)
+rq4_combined_annotations <- rq4_combined_slopes %>% mutate(label = sprintf("Tone-use slope: %.2f %s", tone_centered.trend, 
+    stars))
+write_csv(rq4_combined_slopes, file.path(output_dir, "rq4_combined_slopes.csv"))
+write_csv(rq4_combined_grid, file.path(output_dir, "rq4_combined_predictions.csv"))
+```
+
+```{r ax-model}
+stopifnot(nrow(ax_scores) > 0, all(ax_scores$occasion == "post"))
+ax_scores <- ax_scores %>% mutate(vot = as.numeric(cue_type == "VOT"), stopless = as.numeric(cue_type == "F0 stopless"))
+rq4a_data <- ax_scores %>% select(participant, condition, cue_type, dprime, vot, stopless) %>% mutate(participant = factor(participant), 
+    condition = factor(condition, levels = 1:4), cue_type = factor(cue_type, levels = c("F0 intact", "F0 stopless", 
+        "VOT")))
+rq4a_fit <- rq4_select(rq4a_data, "condition*cue_type", rq4a_candidates, "rq4a")
+mod_ax <- lmer(formula(rq4a_fit$model), data = rq4a_data, REML = FALSE, control = lmerControl(optimizer = "bobyqa", 
+    optCtrl = list(maxfun = 2e+05)))
+```
+
+```{r rq4a-fixed-effect-tests}
+mod_ax_additive <- update(mod_ax, . ~ . - condition:cue_type)
+mod_ax_cue_only <- update(mod_ax, . ~ . - condition - condition:cue_type)
+ax_interaction_test <- anova(mod_ax_additive, mod_ax)
+ax_condition_test <- anova(mod_ax_cue_only, mod_ax)
+write_csv(as.data.frame(ax_condition_test), file.path(output_dir, "ax_model_condition_test.csv"))
+write_csv(as.data.frame(ax_interaction_test), file.path(output_dir, "ax_model_interaction_test.csv"))
+```
+
+```{r ax-condition-comparisons}
+ax_estimates <- emmeans(mod_ax, ~condition | cue_type, lmer.df = "asymptotic")
+ax_estimates_out <- summary(ax_estimates, infer = TRUE)
+ax_condition_contrasts <- contrast(ax_estimates, "pairwise", by = "cue_type", adjust = "holm")
+ax_condition_contrasts_out <- summary(ax_condition_contrasts, infer = TRUE)
+write_csv(as.data.frame(ax_estimates_out), file.path(output_dir, "ax_model_estimates.csv"))
+write_csv(as.data.frame(ax_condition_contrasts_out), file.path(output_dir, "ax_model_condition_contrasts.csv"))
+```
+
+```{r rq4b-tone-sensitivity}
+rq4_tone_use <- alignment_model_data %>% filter(stop_tone_alignment == "Misaligned") %>% group_by(participant) %>% 
+    summarise(misaligned_tone = mean(correct), lexical_trials = n(), .groups = "drop")
+rq4_tone_mean <- mean(rq4_tone_use$misaligned_tone)
+rq4_data <- ax_scores %>% filter(cue_type %in% c("F0 intact", "F0 stopless")) %>% left_join(rq4_tone_use, by = "participant") %>% 
+    filter(is.finite(dprime), is.finite(misaligned_tone)) %>% mutate(cue_type = droplevels(cue_type), condition = factor(condition, 
+    levels = c("1", "2", "3", "4")), tone_centered = misaligned_tone - rq4_tone_mean)
+rq4_availability <- rq4_data %>% count(condition, cue_type, name = "participants")
+stopifnot(!anyDuplicated(rq4_data[c("participant", "cue_type")]))
+rq4_data <- rq4_data %>% mutate(stopless = as.numeric(cue_type == "F0 stopless"))
+rq4b_model_data <- rq4_data %>% select(participant, condition, cue_type, dprime, tone_centered, stopless) %>% mutate(participant = factor(participant))
+rq4b_fit <- rq4_select(rq4b_model_data, "condition*cue_type+tone_centered*cue_type", rq4b_candidates, "rq4b")
+mod_rq4_association <- rq4b_fit$model
+```
+
+```{r rq4b-model-output}
+rq4_slopes <- emtrends(mod_rq4_association, ~cue_type, var = "tone_centered", lmer.df = "asymptotic")
+rq4_slopes_out <- as.data.frame(summary(rq4_slopes, infer = c(FALSE, TRUE), adjust = "holm")) %>% rename(estimate = tone_centered.trend) %>% 
+    mutate(contrast = as.character(cue_type))
+write_csv(rq4_slopes_out, file.path(output_dir, "rq4b_tone_sensitivity_slopes.csv"))
+write_csv(rq4_availability, file.path(output_dir, "rq4b_task_availability.csv"))
+```
+
+```{r ax-stopless-extension}
+ax_paired_ids <- ax_scores %>% filter(cue_type %in% c("F0 intact", "F0 stopless")) %>% group_by(participant) %>% 
+    summarise(tasks = n_distinct(cue_type), .groups = "drop") %>% filter(tasks == 2)
+ax_paired <- ax_scores %>% semi_join(ax_paired_ids, by = "participant") %>% filter(cue_type %in% c("F0 intact", 
+    "F0 stopless"), is.finite(dprime)) %>% mutate(condition = factor(condition, levels = c("1", "2", "3", "4")), 
+    cue_type = droplevels(cue_type))
+stopifnot(all(count(ax_paired, participant)$n == 2))
+rq4_stopless_data <- ax_paired %>% transmute(participant = factor(participant), condition, cue_type, dprime, stopless = as.numeric(cue_type == 
+    "F0 stopless"))
+rq4_stopless_fit <- rq4_select(rq4_stopless_data, "condition*cue_type", rq4b_candidates, "rq4_stopless")
+mod_ax_stopless <- rq4_stopless_fit$model
+ax_stopless_emm <- emmeans(mod_ax_stopless, ~condition * cue_type, lmer.df = "asymptotic")
+ax_stopless_grid <- as.data.frame(ax_stopless_emm)
+stopifnot(identical(levels(ax_paired$cue_type), c("F0 intact", "F0 stopless")))
+ax_stopless_weights <- lapply(as.character(1:4), function(k) as.numeric(ax_stopless_grid$condition == k) * ifelse(ax_stopless_grid$cue_type == 
+    "F0 stopless", 1, -1))
+names(ax_stopless_weights) <- paste0("C", 1:4, ": stopless minus intact")
+ax_stopless_weights[["C3 minus C4: difference in stopless effect"]] <- ax_stopless_weights[[3]] - ax_stopless_weights[[4]]
+ax_stopless_out <- as.data.frame(summary(contrast(ax_stopless_emm, ax_stopless_weights), infer = c(FALSE, TRUE), 
+    adjust = "holm"))
+write_csv(ax_stopless_out, file.path(output_dir, "ax_stopless_extension.csv"))
+write_csv(ax_paired %>% count(condition, cue_type), file.path(output_dir, "ax_stopless_paired_counts.csv"))
+```
+
+```{r tone-ax-association}
+tone_use <- test_data %>% group_by(participant) %>% summarise(tone_accuracy = mean(tone_consistent), .groups = "drop")
+tone_ax <- ax_scores %>% filter(cue_type == "F0 intact") %>% left_join(tone_use, by = "participant")
+stopifnot(!anyDuplicated(tone_ax$participant))
+mod_association <- lm(dprime ~ factor(condition) + tone_accuracy, data = tone_ax)
+saveRDS(list(tone = mod_tone, alignment = mod_alignment, rq1 = mod_rq1, rq1_c2 = mod_rq1_c2, rq2 = mod_rq2, ax = mod_ax, 
+    association = mod_association, rq3 = rq3_models, rq3_combined = mod_rq3_combined, rq4_misaligned_association = mod_rq4_association, 
+    rq4 = mod_rq4, rq4_combined = mod_rq4_combined, ax_stopless = mod_ax_stopless), file.path(output_dir, "models.rds"))
+association_plot_data <- tone_ax %>% filter(is.finite(tone_accuracy), is.finite(dprime))
+association_grid <- association_plot_data %>% group_by(condition) %>% summarise(tone_accuracy = list(seq(min(tone_accuracy), 
+    max(tone_accuracy), length.out = 50)), .groups = "drop") %>% unnest(tone_accuracy)
+association_predictions <- predict(mod_association, newdata = association_grid, interval = "confidence")
+association_grid <- bind_cols(association_grid, as.data.frame(association_predictions))
+```

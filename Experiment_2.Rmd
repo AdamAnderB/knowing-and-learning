@@ -1,0 +1,1075 @@
+---
+output: html_document
+params:
+  fit_models: true
+  render_figures: false
+  render_extras: false
+  prepare_only: false
+---
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(lme4)
+library(emmeans)
+knitr::opts_chunk$set(echo = FALSE, error = FALSE)
+project_dir <- Sys.getenv("ADAPT_PROJECT_DIR", ".")
+wf_note <- function(...) {
+    line <- paste(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), paste(..., collapse = " "))
+    log <- getOption("model255.progress_log")
+    if (!is.null(log)) 
+        cat(line, "\n", file = log, append = TRUE)
+    flush.console()
+}
+wf_formula <- function(f) stats::as.formula(paste(deparse(f), collapse = " "), env = baseenv())
+wf_compact <- function(f) {
+    if (inherits(f, "merMod")) {
+        attr(f@frame, "terms") <- local({
+            t <- attr(f@frame, "terms")
+            if (!is.null(t)) 
+                environment(t) <- baseenv()
+            t
+        })
+        if (inherits(f@call$formula, "formula")) 
+            environment(f@call$formula) <- baseenv()
+    }
+    else if (inherits(f, "lm")) {
+        if (!is.null(f$terms)) 
+            environment(f$terms) <- baseenv()
+        if (!is.null(f$model)) {
+            t <- attr(f$model, "terms")
+            if (!is.null(t)) 
+                environment(t) <- baseenv()
+            attr(f$model, "terms") <- t
+        }
+        if (inherits(f$call$formula, "formula")) 
+            environment(f$call$formula) <- baseenv()
+    }
+    f
+}
+wf_save <- function(object, file) {
+    if (inherits(object, c("lm", "merMod"))) 
+        object <- wf_compact(object)
+    dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+    tmp <- paste0(file, ".pending")
+    base::saveRDS(object, tmp, compress = FALSE)
+    if (!file.rename(tmp, file)) 
+        stop("Could not finish checkpoint: ", file)
+}
+wf_fingerprint <- function(form, data) {
+    cols <- all.vars(form)
+    dd <- as.data.frame(data[, cols, drop = FALSE])
+    dd[] <- lapply(dd, function(x) if (is.factor(x)) 
+        as.character(x)
+    else if (is.numeric(x)) 
+        as.double(x)
+    else x)
+    digest::digest(list(formula = paste(deparse(form), collapse = " "), data = dd), algo = "sha256")
+}
+wf_ok <- function(f) {
+    if (!inherits(f, "merMod")) 
+        return(FALSE)
+    msg <- f@optinfo$conv$lme4$messages
+    (is.null(f@optinfo$conv$opt) || all(f@optinfo$conv$opt == 0)) && !length(msg[!grepl("boundary.*singular", msg)])
+}
+wf_glmer <- function(form, data, legacy = NULL, optimizer = "nloptwrap", maxeval = 20000, maxfun = 2e+05, ...) {
+    form <- wf_formula(form)
+    signature <- list(fingerprint = wf_fingerprint(form, data), package = as.character(packageVersion("lme4")), 
+        optimizer = optimizer, maxeval = maxeval, maxfun = maxfun)
+    key <- digest::digest(signature, algo = "sha256")
+    file <- file.path(wf_cache_dir, paste0(key, ".rds"))
+    if (file.exists(file)) {
+        old <- readRDS(file)
+        if (identical(old$signature, signature)) {
+            wf_note("CACHE", key)
+            return(old$fit)
+        }
+    }
+    if (!is.null(legacy) && file.exists(legacy) && file.info(legacy)$size < 64 * 1024^2) {
+        old <- tryCatch(readRDS(legacy), error = function(e) NULL)
+        if (is.list(old) && !is.null(old$signature$data) && inherits(old$fit, "merMod") && identical(old$signature$version, 
+            signature$package)) {
+            same <- identical(wf_fingerprint(form, data), wf_fingerprint(wf_formula(as.formula(paste(old$signature$formula, 
+                collapse = " "))), old$signature$data))
+            controls <- identical(old$signature$maxeval, maxeval) && identical(old$signature$maxfun, maxfun)
+            if (same && controls && optimizer == "nloptwrap") {
+                f <- wf_compact(old$fit)
+                wf_save(list(signature = signature, fit = f), file)
+                wf_note("REUSED", basename(legacy))
+                return(f)
+            }
+        }
+    }
+    if (!wf_allow_fit) 
+        stop("No valid checkpoint; enable fit_models for: ", paste(deparse(form), collapse = " "))
+    wf_note("FIT", key, paste(deparse(form), collapse = " "))
+    started <- Sys.time()
+    f <- tryCatch(lme4::glmer(form, data = data, family = binomial, nAGQ = 1, control = lme4::glmerControl(optimizer = optimizer, 
+        optCtrl = if (optimizer == "bobyqa") 
+            list(maxfun = maxfun)
+        else list(maxeval = maxeval))), error = function(e) e)
+    if (inherits(f, "merMod") && !wf_ok(f) && optimizer != "bobyqa") {
+        wf_note("RETRY bobyqa", key)
+        retry <- tryCatch(lme4::glmer(form, data = data, family = binomial, start = list(theta = lme4::getME(f, 
+            "theta"), fixef = lme4::fixef(f)), control = lme4::glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = maxfun))), 
+            error = function(e) e)
+        if (inherits(retry, "merMod")) 
+            f <- retry
+    }
+    if (inherits(f, "merMod")) {
+        f <- wf_compact(f)
+        wf_save(list(signature = signature, fit = f), file)
+    }
+    wf_note("FINISHED", key, "seconds", round(as.numeric(difftime(Sys.time(), started, units = "secs")), 1))
+    f
+}
+wf_lm <- function(formula, data, ...) {
+    form <- wf_formula(formula)
+    signature <- list(fingerprint = wf_fingerprint(form, data), R = as.character(getRversion()), type = "lm")
+    file <- file.path(wf_cache_dir, paste0(digest::digest(signature, algo = "sha256"), ".rds"))
+    if (file.exists(file)) {
+        x <- readRDS(file)
+        if (identical(x$signature, signature)) {
+            wf_note("CACHE lm", basename(file))
+            return(x$fit)
+        }
+    }
+    if (!wf_allow_fit) 
+        stop("Missing linear-model checkpoint")
+    wf_note("FIT lm", paste(deparse(form), collapse = " "))
+    f <- wf_compact(stats::lm(form, data = data, ...))
+    wf_save(list(signature = signature, fit = f), file)
+    f
+}
+wf_allow_fit <- isTRUE(params$fit_models)
+```
+
+```{r paths}
+wf_note("SECTION paths")
+project_dir <- Sys.getenv("ADAPT_PROJECT_DIR", ".")
+target_dir <- Sys.getenv("EXP25_DATA_DIR", file.path(project_dir, "data", "exp_2.5"))
+spread_dir <- file.path(target_dir, "spread_data_4")
+fallback_spread_dir <- file.path(target_dir, "spread_data_2")
+output_dir <- file.path(target_dir, "analysis", "model2.5.5_work_flow")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+study_figure_path <- function(path, project_dir, source_dir, study, section = NULL) {
+    path <- normalizePath(path, winslash = "/", mustWork = FALSE)
+    source_dir <- normalizePath(source_dir, winslash = "/", mustWork = FALSE)
+    prefix <- paste0(sub("/+$", "", source_dir), "/")
+    relative <- if (startsWith(path, prefix)) 
+        substring(path, nchar(prefix) + 1L)
+    else basename(path)
+    destination <- file.path(project_dir, "Adapt", "figures_completed", study)
+    if (!is.null(section)) 
+        destination <- file.path(destination, section)
+    destination <- file.path(destination, relative)
+    dir.create(dirname(destination), recursive = TRUE, showWarnings = FALSE)
+    normalizePath(destination, winslash = "/", mustWork = FALSE)
+}
+dimension_figure_study <- function(filename) {
+    name <- basename(filename)
+    if (grepl("_2([_.]|$)", name) && !grepl("_2_5([_.]|$)", name)) 
+        "2"
+    else "2.5"
+}
+study_condition_colors <- c(`1` = "#000000", `2` = "#3155D9", `3` = "#D49A16", `4` = "#DC2680")
+study_condition_shapes <- c(`1` = 16, `2` = 17, `3` = 15, `4` = 18)
+study_word_colors <- c(eye = "#FF3D00", ear = "#00C9B7", hat = "#A3CE00", banana = "#7044FF")
+study_term_condition <- function(term) {
+    term <- as.character(term)
+    ans <- rep("Shared", length(term))
+    ans[term == "(Intercept)"] <- "1"
+    hit <- grepl("condition[234]", term)
+    ans[hit] <- sub(".*condition([234]).*", "\\1", term[hit])
+    factor(ans, levels = c("1", "2", "3", "4", "Shared"))
+}
+figure_dir <- file.path(project_dir, "Adapt", "figures_completed", "2.5.5")
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+figure_dir <- normalizePath(figure_dir)
+figure_path <- function(path) study_figure_path(path, project_dir, output_dir, "2.5.5", section = "extras")
+knitr::opts_chunk$set(fig.path = paste0(file.path(figure_dir, "extras", "notebook"), "/"), fig.keep = if (isTRUE(params$render_extras)) "all" else "none")
+stopifnot(dir.exists(spread_dir))
+task_map_path <- Sys.getenv("EXP25_TASK_MAP", file.path(target_dir, "task_map.csv"))
+if (!file.exists(task_map_path)) stop("Task map is missing: ", task_map_path, call. = FALSE)
+task_map <- read_csv(task_map_path, col_types = cols(.default = col_character())) %>% rename(task_kind = kind, 
+    map_language = language, map_learning_number = learning_number, map_occasion = occasion)
+if (nrow(task_map) == 0) stop("Task map has no task rows: ", task_map_path, call. = FALSE)
+stopifnot(!anyNA(task_map$task), !anyDuplicated(task_map$task), all(task_map$task_kind %in% c("lexical", "ax")), 
+    all(task_map$map_language %in% c("hindi", "korean", "mandarin")), all(task_map$map_learning_number[task_map$task_kind == 
+        "lexical"] %in% as.character(1:5)), all(task_map$map_occasion[task_map$task_kind == "ax"] %in% c("pre", 
+        "post")))
+wf_cache_dir <- file.path(output_dir, "checkpoints")
+dir.create(wf_cache_dir, recursive = TRUE, showWarnings = FALSE)
+legacy_model_dir <- file.path(target_dir, "analysis", "models")
+options(model255.progress_log = file.path(output_dir, "progress.log"))
+```
+
+```{r raw-import}
+wf_note("SECTION raw-import")
+export_pattern <- "^data_exp_[0-9]+-v[0-9]+_.*[.]csv$"
+csv_files <- list.files(spread_dir, pattern = export_pattern, full.names = TRUE)
+stopifnot(length(csv_files) > 0)
+export_task <- function(paths) {
+    n <- basename(paths)
+    ifelse(grepl("_task-", n), sub("^.*_(task-[a-z0-9]+).*", "\\1", n), NA_character_)
+}
+allowed_fallback_tasks <- c("task-34gz", "task-f7vf", "task-gjva")
+missing_tasks <- setdiff(task_map$task, export_task(csv_files))
+unexpected_missing <- setdiff(missing_tasks, allowed_fallback_tasks)
+if (length(unexpected_missing)) stop("Missing new-export tasks (no fallback authorized): ", paste(unexpected_missing, 
+    collapse = ", "), call. = FALSE)
+fallback_files <- character()
+for (task_id in intersect(missing_tasks, allowed_fallback_tasks)) {
+    candidates <- list.files(fallback_spread_dir, pattern = export_pattern, full.names = TRUE)
+    candidates <- candidates[which(export_task(candidates) == task_id)]
+    if (!length(candidates)) 
+        stop("Missing fallback export for ", task_id, call. = FALSE)
+    fallback_files <- c(fallback_files, candidates)
+}
+csv_files <- c(csv_files, fallback_files)
+for (file in csv_files) {
+    header <- names(read_csv(file, n_max = 0, col_types = cols(.default = col_character()), show_col_types = FALSE))
+    required <- c("Participant Private ID", "Experiment Version", "Tree Node Key")
+    if (!all(required %in% header)) 
+        stop("Invalid export header: ", file, call. = FALSE)
+}
+file_hashes <- unname(tools::md5sum(csv_files))
+stopifnot(!anyNA(file_hashes))
+keep <- !duplicated(file_hashes)
+csv_files <- csv_files[keep]
+file_hashes <- file_hashes[keep]
+import_selection <- tibble(path = csv_files, source_file = basename(csv_files), task = export_task(csv_files), 
+    md5 = file_hashes, collection = if_else(csv_files %in% fallback_files, "spread_data_2 fallback", "spread_data_4"))
+write_csv(import_selection, file.path(output_dir, "import_file_selection.csv"))
+if (any(import_selection$collection == "spread_data_2 fallback")) {
+    message("Temporary older List 5 training exports: ", paste(import_selection$task[import_selection$collection == 
+        "spread_data_2 fallback"], collapse = ", "))
+}
+all_data <- bind_rows(lapply(csv_files, function(file) {
+    read_csv(file, col_types = cols(.default = col_character()), show_col_types = FALSE) %>% mutate(source_file = basename(file))
+})) %>% filter(!is.na(`Participant Private ID`), !is.na(`Experiment Version`))
+all_data <- all_data %>% left_join(task_map, by = c(`Tree Node Key` = "task"))
+response_nodes <- all_data %>% filter(tolower(language) %in% c("hindi", "korean", "mandarin"), (`Zone Type` %in% 
+    c("response_button_image", "timelimit_screen") & display %in% c("practice", "testing")) | (`Zone Type` %in% 
+    c("response_keyboard", "timelimit_screen") & display == "trial"))
+stopifnot(!anyNA(response_nodes$task_kind))
+write_csv(all_data %>% count(source_file, `Task Name`, `Tree Node Key`, name = "rows"), file.path(output_dir, "import_file_inventory.csv"))
+write_csv(all_data %>% distinct(`Participant Private ID`, `Experiment Version`, `Participant Status`) %>% count(`Experiment Version`, 
+    `Participant Status`, name = "participants"), file.path(output_dir, "import_version_counts.csv"))
+```
+
+```{r task-import}
+wf_note("SECTION task-import")
+lexical_raw <- all_data %>% filter(task_kind == "lexical", `Zone Type` %in% c("response_button_image", "timelimit_screen"), 
+    ((display == "practice" & `Screen Name` == "Screen 5") | (display == "testing" & `Screen Name` == "Screen 4"))) %>% 
+    mutate(participant = `Participant Private ID`, session = paste(`Experiment Version`, `Schedule ID`, sep = "_"), 
+        task = `Tree Node Key`, trial = `Spreadsheet Row`, item = paste(language, list_number, word, sep = "_"), 
+        response = if_else(`Zone Type` == "timelimit_screen", NA_character_, Response), answer = case_when(ANSWER == 
+            "q1" ~ q1, ANSWER == "q2" ~ q2, ANSWER == "q3" ~ q3, ANSWER == "q4" ~ q4), rt_ms = as.numeric(`Reaction Time`), 
+        trial_order = as.numeric(`Trial Number`), phase = if_else(display == "practice", "training", "testing"), 
+        spreadsheet = `Manipulation: Spreadsheet`, language = tolower(language), event_time = as.numeric(`UTC Timestamp`), 
+        learning_number = map_learning_number, lexical_stage = case_when(learning_number %in% c("1", "2", "3", 
+            "4") ~ "learning_1_4", learning_number == "5" ~ "learning_5", TRUE ~ "unmapped"), route = source_file, 
+        correct = if_else(is.na(response) | response == "", NA_integer_, as.integer(response == answer)))
+stopifnot(nrow(lexical_raw) > 0, !anyNA(lexical_raw$answer), all(lexical_raw$lexical_stage != "unmapped"))
+stopifnot(all(lexical_raw$experiment == "2.5"), all(lexical_raw$language == lexical_raw$map_language), all(lexical_raw$learning_number == 
+    lexical_raw$list_number))
+assignment <- lexical_raw %>% filter(lexical_stage == "learning_1_4") %>% distinct(participant, language, initial_condition = learning_number)
+stopifnot(all((assignment %>% count(participant, language))$n == 1))
+lexical_raw <- lexical_raw %>% left_join(assignment, by = c("participant", "language"))
+stopifnot(!anyNA(lexical_raw$initial_condition))
+duplicate_trials <- lexical_raw %>% count(participant, session, task, trial) %>% filter(n > 1)
+stopifnot(nrow(duplicate_trials) == 0)
+data <- lexical_raw %>% group_by(participant, session, task, phase) %>% arrange(event_time, trial_order, .by_group = TRUE) %>% 
+    mutate(phase_order = row_number()) %>% ungroup()
+completion_checks <- data %>% count(participant, initial_condition, language, lexical_stage, learning_number, phase, 
+    name = "trials")
+write_csv(completion_checks, file.path(output_dir, "completion_checks.csv"))
+expected_modules <- crossing(language = c("hindi", "korean", "mandarin"), learning_number = as.character(1:5), 
+    phase = c("training", "testing"))
+module_coverage <- data %>% count(language, learning_number, phase, name = "response_trials") %>% right_join(expected_modules, 
+    by = c("language", "learning_number", "phase")) %>% mutate(response_trials = coalesce(response_trials, 0L), 
+    downloaded = response_trials > 0)
+write_csv(module_coverage, file.path(output_dir, "spread_data_module_coverage.csv"))
+if (any(!module_coverage$downloaded)) {
+    warning("spread_data is incomplete: preview plots exclude one or more expected lexical modules. See spread_data_module_coverage.csv before interpreting cell sizes.")
+}
+write_csv(data, file.path(output_dir, "lexical_response_data.csv"))
+```
+
+```{r ax-import}
+wf_note("SECTION ax-import")
+ax <- all_data %>% filter(task_kind == "ax", display == "trial", `Screen Name` == "Screen 3", `Zone Type` %in% 
+    c("response_keyboard", "timelimit_screen")) %>% mutate(participant = `Participant Private ID`, session = paste(`Experiment Version`, 
+    `Schedule ID`, sep = "_"), task = `Tree Node Key`, trial = `Spreadsheet Row`, response = if_else(`Zone Type` == 
+    "timelimit_screen", NA_character_, tolower(Response)), answer = case_when(tolower(ANSWER) %in% c("same", "z") ~ 
+    "z", tolower(ANSWER) %in% c("different", "m") ~ "m"), rt_ms = as.numeric(`Reaction Time`), event_time = as.numeric(`UTC Timestamp`), 
+    language = tolower(language), ax_contrast = condition, cue_type = sub("^.*_ax_", "", ax_contrast), usable = response %in% 
+        c("z", "m") & is.finite(rt_ms) & rt_ms >= 0 & rt_ms <= 1500, hit = usable & answer == "m" & response == 
+        "m", false_alarm = usable & answer == "z" & response == "m", occasion = map_occasion) %>% left_join(assignment, 
+    by = c("participant", "language"))
+stopifnot(!anyNA(ax$initial_condition), all(ax$language == ax$map_language), !anyDuplicated(ax[c("participant", 
+    "session", "task", "trial")]))
+stopifnot(nrow(ax) > 0, !anyNA(ax$answer))
+```
+
+```{r participant-review}
+wf_note("SECTION participant-review")
+rt_participant_quality <- data %>% filter(!is.na(response), response != "", is.finite(rt_ms), rt_ms > 0) %>% mutate(log_rt = log(rt_ms)) %>% 
+    group_by(participant, language, initial_condition, task, lexical_stage, phase) %>% summarise(rt_trials = n(), 
+    median_rt_ms = median(rt_ms), median_log_rt = median(log_rt), .groups = "drop") %>% group_by(language, initial_condition, 
+    task, lexical_stage, phase) %>% mutate(group_n = n(), group_median_log_rt = median(median_log_rt), group_mad_log_rt = mad(median_log_rt, 
+    constant = 1.4826), phase_rt_outlier = group_mad_log_rt > 0 & abs(median_log_rt - group_median_log_rt) > 3 * 
+    group_mad_log_rt) %>% ungroup()
+participant_rt_exclusions <- rt_participant_quality %>% group_by(participant) %>% summarise(rt_phases_screened = n(), 
+    rt_outlier_phases = sum(phase_rt_outlier), rt_quality_exclude = any(phase_rt_outlier), .groups = "drop")
+write_csv(rt_participant_quality, file.path(output_dir, "participant_rt_quality_by_phase.csv"))
+write_csv(participant_rt_exclusions, file.path(output_dir, "participant_rt_quality_exclusions.csv"))
+review_file <- file.path(target_dir, "participant_review.csv")
+review_input <- if (file.exists(review_file)) read_csv(review_file, show_col_types = FALSE, col_types = cols(participant = col_character(), 
+    exclude = col_logical(), reason = col_character())) else tibble(participant = character(), exclude = logical(), 
+    reason = character())
+stopifnot(!anyDuplicated(review_input$participant))
+participant_review <- data %>% distinct(participant) %>% left_join(review_input, by = "participant") %>% mutate(review_pending = is.na(exclude), 
+    manual_exclude = coalesce(exclude, FALSE), manual_reason = reason) %>% left_join(participant_rt_exclusions, 
+    by = "participant") %>% mutate(rt_phases_screened = coalesce(rt_phases_screened, 0L), rt_outlier_phases = coalesce(rt_outlier_phases, 
+    0L), rt_quality_exclude = coalesce(rt_quality_exclude, FALSE), exclude = manual_exclude | rt_quality_exclude, 
+    reason = case_when(rt_quality_exclude ~ paste0("RT exclusion: median log RT beyond 3 scaled MADs in at least one lexical phase", 
+        if_else(manual_exclude, paste0("; manual exclusion: ", coalesce(manual_reason, "reason unspecified")), 
+            "")), manual_exclude ~ coalesce(manual_reason, "Manual exclusion"), rt_phases_screened < 4L ~ "Incomplete RT screen; manual review required", 
+        review_pending ~ "Retained by RT rule; other eligibility review pending", TRUE ~ coalesce(manual_reason, 
+            "Retained")))
+write_csv(participant_review, file.path(output_dir, "participant_review_to_complete.csv"))
+write_csv(participant_review, file.path(output_dir, "participant_review_applied.csv"))
+participant_removal <- data %>% distinct(participant, initial_condition, language) %>% left_join(participant_review, 
+    by = "participant") %>% count(initial_condition, language, exclude, reason, name = "participants")
+write_csv(participant_removal, file.path(output_dir, "participant_removal.csv"))
+participant_retention_counts <- data %>% distinct(participant, initial_condition, language) %>% left_join(participant_review, 
+    by = "participant") %>% group_by(language, initial_condition) %>% summarise(before = n(), rt_excluded = sum(rt_quality_exclude), 
+    excluded = sum(exclude), retained = sum(!exclude), .groups = "drop")
+write_csv(participant_retention_counts, file.path(output_dir, "participant_retention_counts.csv"))
+participant_retention_counts
+```
+
+```{r ax-score-reviewed}
+wf_note("SECTION ax-score-reviewed")
+ax_scores <- ax %>% filter(participant %in% participant_review$participant[!participant_review$exclude]) %>% group_by(participant, 
+    initial_condition, language, occasion, cue_type) %>% summarise(total = n(), omissions = sum(!usable), n_different = sum(usable & 
+    answer == "m"), n_same = sum(usable & answer == "z"), hits = sum(hit), false_alarms = sum(false_alarm), accuracy = sum(usable & 
+    response == answer, na.rm = TRUE)/n(), .groups = "drop") %>% mutate(hit_rate = (hits + 0.5)/(n_different + 
+    1), fa_rate = (false_alarms + 0.5)/(n_same + 1), dprime = if_else(n_different > 0 & n_same > 0, qnorm(hit_rate) - 
+    qnorm(fa_rate), NA_real_), bias_c = if_else(n_different > 0 & n_same > 0, -(qnorm(hit_rate) + qnorm(fa_rate))/2, 
+    NA_real_))
+write_csv(ax_scores, file.path(output_dir, "ax_preliminary_scores.csv"))
+```
+
+```{r behavioral-cleanup}
+wf_note("SECTION behavioral-cleanup")
+data_cleaned <- data %>% filter(participant %in% participant_review$participant[!participant_review$exclude]) %>% 
+    mutate(missing_response = is.na(response) | response == "", log_rt = if_else(is.finite(rt_ms) & rt_ms > 0, 
+        log(pmax(rt_ms, 0.001)), NA_real_))
+accuracy_data <- data_cleaned %>% filter(!is.na(correct))
+rt_screening <- accuracy_data %>% filter(correct == 1, is.finite(rt_ms), rt_ms > 0) %>% group_by(participant, language, 
+    task, lexical_stage, phase) %>% mutate(rt_group_n = n(), median_log_rt = median(log_rt), mad_rt = mad(log_rt, 
+    constant = 1), rt_outlier = rt_group_n >= 5 & mad_rt > 0 & abs(log_rt - median_log_rt) > 3 * mad_rt) %>% ungroup()
+rt_data <- rt_screening %>% filter(!rt_outlier)
+stopifnot(!any(rt_data$rt_outlier))
+trial_retention <- data_cleaned %>% group_by(initial_condition, language, lexical_stage, phase) %>% summarise(total = n(), 
+    omissions = sum(missing_response), accuracy_trials = sum(!is.na(correct)), .groups = "drop") %>% left_join(rt_screening %>% 
+    group_by(initial_condition, language, lexical_stage, phase) %>% summarise(rt_candidates = n(), rt_outliers_removed = sum(rt_outlier), 
+    rt_retained = sum(!rt_outlier), .groups = "drop"), by = c("initial_condition", "language", "lexical_stage", 
+    "phase"))
+write_csv(trial_retention, file.path(output_dir, "trial_retention.csv"))
+write_csv(rt_screening %>% select(participant, language, initial_condition, session, task, trial, item, lexical_stage, 
+    phase, rt_ms, log_rt, rt_group_n, median_log_rt, mad_rt, rt_outlier), file.path(output_dir, "rt_screening.csv"))
+write_csv(rt_data %>% select(participant, language, initial_condition, task, trial, item, lexical_stage, phase, 
+    rt_ms, log_rt), file.path(output_dir, "rt_retained_trials.csv"))
+rt_summary <- rt_data %>% group_by(initial_condition, language, lexical_stage, phase) %>% summarise(rt_trials = n(), 
+    median_rt = median(rt_ms), mean_log_rt = mean(log_rt), .groups = "drop")
+write_csv(rt_summary, file.path(output_dir, "rt_cleaned_summary.csv"))
+trial_retention
+```
+
+```{r descriptive-checks}
+wf_note("SECTION descriptive-checks")
+participant_accuracy <- accuracy_data %>% group_by(participant, initial_condition, language, lexical_stage, phase) %>% 
+    summarise(accuracy = mean(correct), trials = n(), .groups = "drop")
+item_accuracy <- accuracy_data %>% group_by(item, initial_condition, language, lexical_stage, phase) %>% summarise(accuracy = mean(correct), 
+    trials = n(), .groups = "drop")
+write_csv(participant_accuracy, file.path(output_dir, "participant_accuracy.csv"))
+write_csv(item_accuracy, file.path(output_dir, "item_accuracy.csv"))
+```
+
+```{r retention-assertions}
+wf_note("SECTION retention-assertions")
+excluded_ids <- participant_review$participant[participant_review$exclude]
+stopifnot(!any(accuracy_data$participant %in% excluded_ids), !any(ax_scores$participant %in% excluded_ids))
+wf_note("PARTICIPANTS", n_distinct(data$participant), "before;", length(unique(excluded_ids)), "excluded;", n_distinct(accuracy_data$participant), 
+    "retained")
+```
+
+```{r lexical-learning-1-4}
+wf_note("SECTION lexical-learning-1-4")
+learning_1_4 <- accuracy_data %>% filter(lexical_stage == "learning_1_4") %>% mutate(block = ceiling(phase_order/8))
+learning_1_4_summary <- learning_1_4 %>% group_by(initial_condition, language, learning_number, phase) %>% summarise(trials = n(), 
+    accuracy = mean(correct), .groups = "drop") %>% left_join(rt_summary %>% filter(lexical_stage == "learning_1_4") %>% 
+    select(-lexical_stage), by = c("initial_condition", "language", "phase"))
+learning_1_4_curve <- learning_1_4 %>% group_by(participant, initial_condition, language, learning_number, phase, 
+    block) %>% summarise(accuracy = mean(correct), .groups = "drop") %>% group_by(initial_condition, language, 
+    learning_number, phase, block) %>% summarise(accuracy = mean(accuracy), participants = n(), .groups = "drop")
+write_csv(learning_1_4_summary, file.path(output_dir, "descriptive_learning_1_4_summary.csv"))
+write_csv(learning_1_4_curve, file.path(output_dir, "descriptive_learning_1_4_curve.csv"))
+learning_1_4_participant <- learning_1_4 %>% group_by(participant, initial_condition, language, phase) %>% summarise(accuracy = mean(correct), 
+    trials = n(), .groups = "drop")
+learning_1_4_average <- learning_1_4_participant %>% group_by(initial_condition, language, phase) %>% summarise(accuracy = mean(accuracy), 
+    participants = n(), .groups = "drop")
+```
+
+```{r ax-descriptives}
+wf_note("SECTION ax-descriptives")
+ax_change <- ax_scores %>% filter(occasion %in% c("pre", "post")) %>% select(participant, initial_condition, language, 
+    occasion, cue_type, dprime) %>% mutate(occasion = factor(occasion, levels = c("pre", "post"))) %>% pivot_wider(names_from = occasion, 
+    values_from = dprime, names_expand = TRUE) %>% mutate(change = post - pre)
+write_csv(ax_scores, file.path(output_dir, "descriptive_ax_summary.csv"))
+write_csv(ax_change, file.path(output_dir, "descriptive_ax_pre_post_change.csv"))
+ax_plot_data <- ax_scores %>% filter(occasion %in% c("pre", "post")) %>% mutate(test = factor(paste(language, cue_type, 
+    sep = "\n"), levels = c("hindi\naspirated", "hindi\nvoiced", "korean\nb_bb", "korean\nn_ng", "mandarin\nfricative", 
+    "mandarin\ntonal")), occasion = factor(occasion, levels = c("pre", "post")))
+ax_change_average <- ax_change %>% group_by(initial_condition, language, cue_type) %>% summarise(change = if (all(is.na(change))) NA_real_ else mean(change, 
+    na.rm = TRUE), participants = sum(!is.na(change)), .groups = "drop")
+```
+
+```{r lexical-learning-5}
+wf_note("SECTION lexical-learning-5")
+learning_5 <- accuracy_data %>% filter(lexical_stage == "learning_5") %>% mutate(block = ceiling(phase_order/8))
+learning_5_summary <- learning_5 %>% group_by(initial_condition, language, phase) %>% summarise(trials = n(), accuracy = mean(correct), 
+    .groups = "drop") %>% left_join(rt_summary %>% filter(lexical_stage == "learning_5") %>% select(-lexical_stage), 
+    by = c("initial_condition", "language", "phase"))
+learning_5_curve <- learning_5 %>% group_by(participant, initial_condition, language, phase, block) %>% summarise(accuracy = mean(correct), 
+    .groups = "drop") %>% group_by(initial_condition, language, phase, block) %>% summarise(accuracy = mean(accuracy), 
+    participants = n(), .groups = "drop")
+write_csv(learning_5_summary, file.path(output_dir, "descriptive_learning_5_summary.csv"))
+write_csv(learning_5_curve, file.path(output_dir, "descriptive_learning_5_curve.csv"))
+learning_5_participant <- learning_5 %>% group_by(participant, initial_condition, language, phase) %>% summarise(accuracy = mean(correct), 
+    trials = n(), .groups = "drop")
+learning_5_average <- learning_5_participant %>% group_by(initial_condition, language, phase) %>% summarise(accuracy = mean(accuracy), 
+    participants = n(), .groups = "drop")
+```
+
+```{r decode-cue-responses}
+wf_note("SECTION decode-cue-responses")
+condition_labels <- c(`1` = "1: Least dense", `2` = "2: Cue 1 dense", `3` = "3: Cue 2 dense", `4` = "4: Both dense")
+cue_map <- tibble::tribble(~language, ~cue_type, ~cue, ~contrast_name, "hindi", "aspirated", "Cue1", "Aspiration", 
+    "hindi", "voiced", "Cue2", "Voicing", "korean", "b_bb", "Cue1", "Lax–tense stop", "korean", "n_ng", "Cue2", 
+    "Nasal coda", "mandarin", "tonal", "Cue1", "Tone", "mandarin", "fricative", "Cue2", "Consonant place")
+contrast_labels <- list(hindi = c(Cue1 = "Aspiration (aspirated–unaspirated)", Cue2 = "Voicing (voiced–voiceless)"), 
+    korean = c(Cue1 = "Stop (b–bb)", Cue2 = "Coda (n–ng)"), mandarin = c(Cue1 = "Tone (1–3)", Cue2 = "Consonant (zh–j)"))
+contrast_short <- list(hindi = c("Aspiration", "Voicing"), korean = c("b–bb", "n–ng"), mandarin = c("Tone", 
+    "zh–j"))
+cue_display <- function(cue, language) mapply(function(c, l) unname(contrast_labels[[l]][c]), as.character(cue), 
+    as.character(language), USE.NAMES = FALSE)
+condition_display <- function(condition, language) mapply(function(c, l) {
+    labels <- c("1: Least dense", paste0("2: ", contrast_short[[l]][1], " dense"), paste0("3: ", contrast_short[[l]][2], 
+        " dense"), "4: Both dense")
+    labels[as.integer(as.character(c))]
+}, condition, language, USE.NAMES = FALSE)
+cue_panel <- function(cue, language) paste(tools::toTitleCase(language), cue_display(cue, language), sep = "\n")
+word_key <- data %>% distinct(participant, language, learning_number, word, answer)
+stopifnot(!anyDuplicated(word_key[c("participant", "language", "learning_number", "answer")]), !anyDuplicated(word_key[c("participant", 
+    "language", "learning_number", "word")]))
+stopifnot(all((word_key %>% count(participant, language, learning_number))$n == 4))
+word_key <- word_key %>% mutate(cue1 = case_when(language == "hindi" ~ if_else(grepl("^[bp]h", word), "aspirated", 
+    "unaspirated"), language == "korean" ~ if_else(grepl("^bb", word), "tense", "lax"), language == "mandarin" ~ 
+    sub(".*_", "", word)), cue2 = case_when(language == "hindi" ~ if_else(grepl("^b", word), "voiced", "voiceless"), 
+    language == "korean" ~ if_else(grepl("ng$", word), "ng", "n"), language == "mandarin" ~ if_else(grepl("^zh", 
+        word), "retroflex", "alveolopalatal")))
+stopifnot(all(grepl("^[bp]h?", word_key$word[word_key$language == "hindi"])), all(grepl("^b.*n(g)?$", word_key$word[word_key$language == 
+    "korean"])), all(grepl("^(zh|j).*_[13]$", word_key$word[word_key$language == "mandarin"])))
+cue_responses <- accuracy_data %>% select(participant, language, initial_condition, learning_number, lexical_stage, 
+    phase, task, trial, word, answer, response, correct, q1, q2, q3, q4) %>% left_join(word_key %>% select(-answer) %>% 
+    rename(target_cue1 = cue1, target_cue2 = cue2), by = c("participant", "language", "learning_number", "word")) %>% 
+    left_join(word_key %>% rename(response = answer, selected_word = word, selected_cue1 = cue1, selected_cue2 = cue2), 
+        by = c("participant", "language", "learning_number", "response")) %>% mutate(cue1_match = as.integer(target_cue1 == 
+    selected_cue1), cue2_match = as.integer(target_cue2 == selected_cue2), response_class = case_when(correct == 
+    1 ~ "Correct word", cue1_match == 1 & cue2_match == 1 ~ "Wrong word: both cues match", cue1_match == 1 ~ "Wrong word: Cue 1 matches", 
+    cue2_match == 1 ~ "Wrong word: Cue 2 matches", TRUE ~ "Wrong word: neither matches"), condition = factor(initial_condition, 
+    levels = as.character(1:4)), model_item = paste(language, word, sep = "_"), response_id = paste(participant, 
+    task, trial, sep = "_"))
+stopifnot(!anyNA(cue_responses$selected_word), !anyNA(cue_responses$target_cue1), !anyDuplicated(cue_responses$response_id), 
+    all(cue_responses$correct == as.integer(cue_responses$word == cue_responses$selected_word)), all(cue_responses$cue1_match[cue_responses$correct == 
+        1] == 1), all(cue_responses$cue2_match[cue_responses$correct == 1] == 1))
+alternatives <- cue_responses %>% select(response_id, participant, language, learning_number, lexical_stage, phase, 
+    initial_condition, word, answer, target_cue1, target_cue2, q1, q2, q3, q4) %>% pivot_longer(q1:q4, names_to = "position", 
+    values_to = "picture") %>% left_join(word_key %>% rename(picture = answer, alternative_word = word, alternative_cue1 = cue1, 
+    alternative_cue2 = cue2), by = c("participant", "language", "learning_number", "picture")) %>% mutate(option_cue1_match = target_cue1 == 
+    alternative_cue1, option_cue2_match = target_cue2 == alternative_cue2)
+stopifnot(!anyNA(alternatives$alternative_word), all((alternatives %>% count(response_id))$n == 4))
+opportunity <- alternatives %>% group_by(response_id) %>% summarise(chance_cue1 = mean(option_cue1_match), chance_cue2 = mean(option_cue2_match), 
+    options_both = sum(option_cue1_match & option_cue2_match), options_cue1_only = sum(option_cue1_match & !option_cue2_match), 
+    options_cue2_only = sum(!option_cue1_match & option_cue2_match), options_neither = sum(!option_cue1_match & 
+        !option_cue2_match), .groups = "drop")
+cue_responses <- cue_responses %>% left_join(opportunity, by = "response_id")
+cue_long <- cue_responses %>% pivot_longer(c(cue1_match, cue2_match), names_to = "cue", values_to = "cue_match") %>% 
+    mutate(cue = factor(if_else(cue == "cue1_match", "Cue1", "Cue2"), levels = c("Cue1", "Cue2")), chance = if_else(cue == 
+        "Cue1", chance_cue1, chance_cue2)) %>% left_join(cue_map, by = c("language", "cue"))
+stopifnot(all(cue_long$chance == 0.5))
+write_csv(word_key, file.path(output_dir, "participant_word_cue_key.csv"))
+write_csv(cue_map, file.path(output_dir, "model_cue_mapping.csv"))
+write_csv(cue_responses, file.path(output_dir, "cue_scored_responses.csv"))
+write_csv(alternatives %>% distinct(language, learning_number, word, target_cue1, target_cue2, alternative_word, 
+    alternative_cue1, alternative_cue2, option_cue1_match, option_cue2_match), file.path(output_dir, "word_pair_cue_matches.csv"))
+lexicon_opportunities <- cue_responses %>% distinct(language, learning_number, word, chance_cue1, chance_cue2, 
+    options_both, options_cue1_only, options_cue2_only, options_neither)
+write_csv(lexicon_opportunities, file.path(output_dir, "lexicon_cue_opportunities.csv"))
+```
+
+```{r rq1-descriptives}
+wf_note("SECTION rq1-descriptives")
+initial <- cue_responses %>% filter(lexical_stage == "learning_1_4", phase == "testing")
+initial_cues <- cue_long %>% filter(lexical_stage == "learning_1_4", phase == "testing")
+initial_accuracy <- initial %>% group_by(participant, language, condition) %>% summarise(overall_accuracy = mean(correct), 
+    cue1_accuracy = mean(cue1_match), cue2_accuracy = mean(cue2_match), .groups = "drop")
+write_csv(initial_accuracy, file.path(output_dir, "rq1_participant_accuracy.csv"))
+raw_accuracy <- initial_accuracy %>% pivot_longer(ends_with("accuracy"), names_to = "measure", values_to = "accuracy") %>% 
+    mutate(measure = mapply(function(m, l) if (m == "overall_accuracy") "Whole-word accuracy" else paste0(contrast_short[[l]][if (m == 
+        "cue1_accuracy") 1 else 2], " accuracy"), measure, language), panel = paste(tools::toTitleCase(language), 
+        measure, sep = "\n"), condition_label = condition_display(condition, language))
+response_classes <- c("Correct word", "Wrong word: both cues match", "Wrong word: Cue 1 matches", "Wrong word: Cue 2 matches", 
+    "Wrong word: neither matches")
+confusions <- initial %>% count(participant, language, condition, response_class) %>% group_by(participant, language, 
+    condition) %>% complete(response_class = response_classes, fill = list(n = 0L)) %>% mutate(proportion = n/sum(n)) %>% 
+    ungroup() %>% group_by(language, condition, response_class) %>% summarise(proportion = mean(proportion), .groups = "drop") %>% 
+    mutate(response_class = factor(response_class, levels = response_classes))
+write_csv(confusions, file.path(output_dir, "rq1_response_classes.csv"))
+```
+
+```{r revised-model-inputs}
+wf_note("SECTION revised-model-inputs")
+changes <- ax_change %>% left_join(cue_map, by = c("language", "cue_type")) %>% mutate(condition = factor(initial_condition, 
+    levels = as.character(1:4)), cue = factor(cue, levels = c("Cue1", "Cue2")))
+stopifnot(!anyNA(changes$cue), !anyDuplicated(changes[c("participant", "cue")]))
+rq2_data <- changes %>% left_join(initial_accuracy, by = c("participant", "language", "condition")) %>% mutate(matched_accuracy = if_else(cue == 
+    "Cue1", cue1_accuracy, cue2_accuracy)) %>% filter(is.finite(change), is.finite(overall_accuracy), is.finite(matched_accuracy))
+rq2_centers <- rq2_data %>% group_by(language, cue) %>% summarise(overall_center = mean(overall_accuracy), matched_center = mean(matched_accuracy), 
+    .groups = "drop")
+rq2_data <- rq2_data %>% left_join(rq2_centers, by = c("language", "cue")) %>% mutate(overall_accuracy_c = overall_accuracy - 
+    overall_center, matched_accuracy_c = matched_accuracy - matched_center)
+transfer_predictors <- initial_accuracy %>% left_join(changes %>% select(participant, language, cue, change) %>% 
+    pivot_wider(names_from = cue, values_from = change, names_prefix = "delta_"), by = c("participant", "language")) %>% 
+    mutate(complete_predictors = is.finite(overall_accuracy) & is.finite(cue1_accuracy) & is.finite(cue2_accuracy) & 
+        is.finite(delta_Cue1) & is.finite(delta_Cue2))
+rq3_centers <- transfer_predictors %>% filter(complete_predictors) %>% group_by(language) %>% summarise(across(c(overall_accuracy, 
+    cue1_accuracy, cue2_accuracy, delta_Cue1, delta_Cue2), mean, .names = "{.col}_center"), .groups = "drop")
+transfer_predictors <- transfer_predictors %>% left_join(rq3_centers, by = "language") %>% mutate(overall_accuracy_c = overall_accuracy - 
+    overall_accuracy_center, cue1_accuracy_c = cue1_accuracy - cue1_accuracy_center, cue2_accuracy_c = cue2_accuracy - 
+    cue2_accuracy_center, delta1_c = delta_Cue1 - delta_Cue1_center, delta2_c = delta_Cue2 - delta_Cue2_center)
+rq3_data <- cue_responses %>% filter(lexical_stage == "learning_5", phase == "testing") %>% inner_join(transfer_predictors %>% 
+    filter(complete_predictors), by = c("participant", "language", "condition"))
+write_csv(rq2_centers, file.path(output_dir, "rq2_predictor_centering.csv"))
+write_csv(rq3_centers, file.path(output_dir, "rq3_predictor_centering.csv"))
+write_csv(transfer_predictors, file.path(output_dir, "rq3_predictor_completeness.csv"))
+write_csv(initial, file.path(output_dir, "rq1_overall_model_data.csv"))
+write_csv(initial_cues, file.path(output_dir, "rq1_cue_model_data.csv"))
+write_csv(rq2_data, file.path(output_dir, "rq2_model_data.csv"))
+write_csv(rq3_data, file.path(output_dir, "rq3_model_data.csv"))
+```
+
+```{r rq1-selected-fit}
+wf_note("SECTION rq1-selected-fit")
+library(emmeans)
+model_dir <- file.path(output_dir, "models")
+dir.create(model_dir, showWarnings = FALSE)
+rq1_select_random <- function(d, lang, model_dir) {
+    d <- as.data.frame(d)
+    d$condition <- factor(d$condition, levels = 1:4)
+    d$participant <- factor(d$participant)
+    d$model_item <- factor(d$model_item)
+    stopifnot(!anyNA(d[c("correct", "condition", "participant", "model_item")]), all(d$correct %in% 0:1), all(tapply(d$condition, 
+        d$participant, function(x) length(unique(x))) == 1))
+    for (j in 2:4) d[[paste0("c", j)]] <- as.numeric(d$condition == j)
+    coverage <- distinct(as_tibble(d), model_item, condition)
+    write_csv(coverage, file.path(model_dir, paste0("RQ1_", lang, "_item_condition_coverage.csv")))
+    cov_design <- function(slopes, correlated) {
+        zz <- model.matrix(reformulate(slopes), d)
+        pairs <- if (correlated) 
+            which(upper.tri(matrix(0, ncol(zz), ncol(zz)), diag = TRUE), arr.ind = TRUE)
+        else cbind(seq_len(ncol(zz)), seq_len(ncol(zz)))
+        blocks <- lapply(split(seq_len(nrow(d)), d$model_item), function(ii) {
+            z <- unique(zz[ii, , drop = FALSE])
+            ab <- expand.grid(a = seq_len(nrow(z)), b = seq_len(nrow(z)))
+            sapply(seq_len(nrow(pairs)), function(k) {
+                a <- pairs[k, 1]
+                b <- pairs[k, 2]
+                z[ab$a, a] * z[ab$b, b] + if (a != b) 
+                  z[ab$a, b] * z[ab$b, a]
+                else 0
+            })
+        })
+        mm <- do.call(rbind, blocks)
+        c(rank = qr(mm)$rank, parameters = ncol(mm))
+    }
+    specs <- list(maximal_correlated = list(slopes = c("c2", "c3", "c4"), correlated = TRUE))
+    for (n in 3:0) {
+        sets <- if (n == 0) 
+            list(character())
+        else combn(c("c2", "c3", "c4"), n, simplify = FALSE)
+        for (s in sets) specs[[if (length(s)) 
+            paste0("independent_", paste(s, collapse = "_"))
+        else "random_intercepts"]] <- list(slopes = s, correlated = FALSE)
+    }
+    fits <- list()
+    rows <- list()
+    for (nm in names(specs)) {
+        sp <- specs[[nm]]
+        rk <- cov_design(sp$slopes, sp$correlated)
+        rhs <- if (sp$correlated) 
+            "(1+c2+c3+c4|model_item)"
+        else paste(c("(1|model_item)", paste0("(0+", sp$slopes, "|model_item)")[seq_along(sp$slopes)]), collapse = "+")
+        ff <- as.formula(paste("correct~condition+(1|participant)+", rhs))
+        f <- NULL
+        ww <- character()
+        cv <- FALSE
+        sg <- NA
+        if (rk[1] == rk[2]) {
+            message(lang, ": ", nm)
+            f <- withCallingHandlers(tryCatch(wf_glmer(ff, data = d, optimizer = "bobyqa"), error = function(e) e), 
+                warning = function(w) {
+                  ww <<- c(ww, conditionMessage(w))
+                  invokeRestart("muffleWarning")
+                })
+            if (inherits(f, "merMod")) {
+                msgs <- f@optinfo$conv$lme4$messages
+                cv <- (is.null(f@optinfo$conv$opt) || all(f@optinfo$conv$opt == 0)) && !length(msgs[!grepl("boundary.*singular", 
+                  msgs)])
+                sg <- lme4::isSingular(f)
+                ww <- unique(c(ww, msgs))
+                wf_save(f, file.path(model_dir, paste0("RQ1_", lang, "_candidate_", nm, ".rds")))
+            }
+            else ww <- conditionMessage(f)
+        }
+        else ww <- "Skipped: random covariance components not identifiable from item-condition coverage"
+        ok <- inherits(f, "merMod")
+        fits[[nm]] <- f
+        rows[[nm]] <- tibble(language = lang, candidate = nm, formula = paste(deparse(ff), collapse = " "), covariance_rank = rk[1], 
+            covariance_parameters = rk[2], converged = cv, singular = sg, eligible = ok && cv && !isTRUE(sg), AIC = if (ok) 
+                AIC(f)
+            else NA_real_, diagnostic = paste(ww, collapse = "; "))
+        write_csv(bind_rows(rows), file.path(model_dir, paste0("RQ1_", lang, "_random_selection.csv")))
+    }
+    tab <- bind_rows(rows)
+    if (!any(tab$eligible)) 
+        stop("RQ1 ", lang, ": no converged nonsingular candidate. See selection log.")
+    best <- tab$candidate[which.min(ifelse(tab$eligible, tab$AIC, Inf))]
+    tab <- tab %>% mutate(selected = candidate == best, delta_AIC = if_else(eligible, AIC - min(AIC[eligible]), 
+        NA_real_))
+    write_csv(tab, file.path(model_dir, paste0("RQ1_", lang, "_random_selection.csv")))
+    wf_save(fits[[best]], file.path(model_dir, paste0("RQ1_overall_", lang, ".rds")))
+    list(model = fits[[best]], selection = tab)
+}
+model_specs <- list(RQ1_overall = correct ~ condition + (1 | participant) + (1 | model_item))
+model_inputs <- list(RQ1_overall = initial)
+models <- list()
+diagnostic_rows <- list()
+coefficient_rows <- list()
+collinearity_rows <- list()
+for (spec in names(model_specs)) for (lang in c("hindi", "korean", "mandarin")) {
+    key <- paste(spec, lang, sep = "_")
+    is_ax <- startsWith(spec, "RQ2")
+    dd <- as.data.frame(filter(model_inputs[[spec]], language == lang))
+    stopifnot(nrow(dd) > 0, length(unique(dd$condition)) == 4)
+    mm <- model.matrix(lme4::nobars(model_specs[[spec]]), dd)
+    stopifnot(qr(mm)$rank == ncol(mm))
+    warnings_seen <- character()
+    fit <- if (spec == "RQ1_overall") {
+        selected_rq1 <- rq1_select_random(dd, lang, model_dir)
+        selected_rq1$model
+    }
+    else withCallingHandlers({
+        glmer(model_specs[[spec]], data = dd, family = binomial, control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e+05)))
+    }, warning = function(w) {
+        warnings_seen <<- c(warnings_seen, conditionMessage(w))
+        invokeRestart("muffleWarning")
+    })
+    conv <- fit@optinfo$conv$lme4$messages
+    numerical_messages <- conv[!grepl("boundary.*singular", conv)]
+    converged <- (is.null(fit@optinfo$conv$opt) || all(fit@optinfo$conv$opt == 0)) && length(numerical_messages) == 
+        0
+    if (!converged) 
+        stop("Nonconverged model: ", key, "; ", paste(conv, collapse = "; "))
+    models[[key]] <- fit
+    wf_save(fit, file.path(model_dir, paste0(key, ".rds")))
+    diagnostic_rows[[key]] <- tibble(model = spec, language = lang, observations = nobs(fit), participants = n_distinct(dd$participant), 
+        items = if (is_ax) 
+            NA_integer_
+        else n_distinct(dd$model_item), converged = converged, singular = isSingular(fit), AIC = AIC(fit), fixed_design_condition_number = kappa(mm), 
+        warnings = paste(unique(c(warnings_seen, conv)), collapse = "; "))
+    cc <- as.data.frame(coef(summary(fit)))
+    coefficient_rows[[key]] <- tibble(model = spec, language = lang, term = rownames(cc), estimate = cc$Estimate, 
+        SE = cc$`Std. Error`) %>% mutate(lower = estimate - qnorm(0.975) * SE, upper = estimate + qnorm(0.975) * 
+        SE, p = 2 * pnorm(-abs(estimate/SE)), stars = case_when(p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ 
+        "*", TRUE ~ ""))
+    capture.output(summary(fit), file = file.path(model_dir, paste0(key, "_summary.txt")))
+    write_csv(as.data.frame(VarCorr(fit)), file.path(model_dir, paste0(key, "_random_effects.csv")))
+}
+model_diagnostics <- bind_rows(diagnostic_rows)
+model_coefficients <- bind_rows(coefficient_rows)
+write_csv(model_diagnostics, file.path(output_dir, "model_diagnostics.csv"))
+write_csv(model_coefficients, file.path(output_dir, "model_coefficients.csv"))
+predictor_correlations <- bind_rows(lapply(c("hindi", "korean", "mandarin"), function(lang) {
+    dd <- transfer_predictors %>% filter(language == lang, complete_predictors) %>% select(overall_accuracy, cue1_accuracy, 
+        cue2_accuracy, delta_Cue1, delta_Cue2)
+    out <- as.data.frame(as.table(cor(dd)))
+    names(out) <- c("predictor_1", "predictor_2", "correlation")
+    mutate(out, language = lang)
+}))
+write_csv(predictor_correlations, file.path(output_dir, "predictor_correlations.csv"))
+```
+
+```{r theory-setup}
+wf_note("SECTION theory-setup")
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+theory_dir <- normalizePath(output_dir)
+ax <- read_csv(file.path(theory_dir, "descriptive_ax_pre_post_change.csv"), show_col_types = FALSE) %>% left_join(read_csv(file.path(theory_dir, 
+    "model_cue_mapping.csv"), show_col_types = FALSE), by = c("language", "cue_type"))
+stopifnot(!anyNA(ax$cue), !anyDuplicated(ax[c("participant", "language", "cue")]))
+baseline <- ax %>% select(participant, language, cue, pre) %>% pivot_wider(names_from = cue, values_from = pre, 
+    names_prefix = "pre_")
+ax <- left_join(ax, baseline, by = c("participant", "language")) %>% mutate(condition = factor(initial_condition, 
+    levels = 1:4))
+labels <- list(hindi = c(Cue1 = "Aspiration", Cue2 = "Voicing"), korean = c(Cue1 = "Stop (b–bb)", Cue2 = "Coda (n–ng)"), 
+    mandarin = c(Cue1 = "Tone (1–3)", Cue2 = "Consonant (zh–j)"))
+coef_rows <- list()
+selection_rows <- list()
+comparison_rows <- list()
+prediction_rows <- list()
+residual_rows <- list()
+data_rows <- list()
+for (lang in c("hindi", "korean", "mandarin")) for (cu in c("Cue1", "Cue2")) {
+    dd0 <- filter(ax, language == lang, cue == cu)
+    dd <- dd0 %>% filter(is.finite(post), is.finite(pre_Cue1), is.finite(pre_Cue2), !is.na(condition)) %>% mutate(pre1_c = pre_Cue1 - 
+        mean(pre_Cue1), pre2_c = pre_Cue2 - mean(pre_Cue2)) %>% as.data.frame()
+    stopifnot(!anyDuplicated(dd$participant), n_distinct(dd$condition) == 4)
+    key <- paste(lang, cu, sep = "_")
+    title <- paste(tools::toTitleCase(lang), labels[[lang]][[cu]], sep = " — ")
+    full <- wf_lm(post ~ condition * (pre1_c + pre2_c), dd, na.action = na.fail)
+    stopifnot(full$rank == ncol(model.matrix(full)))
+    wf_save(full, file.path(theory_dir, "models", paste0("RQ2_theory_start_", key, ".rds")))
+    current <- full
+    active <- c("condition:pre1_c", "condition:pre2_c")
+    step <- 0
+    repeat {
+        if (!length(active)) 
+            break
+        step <- step + 1
+        tests <- list()
+        fits <- list()
+        for (term in active) {
+            reduced <- wf_lm(reformulate(c("condition", "pre1_c", "pre2_c", setdiff(active, term)), response = "post"), 
+                dd, na.action = na.fail)
+            stopifnot(nobs(reduced) == nobs(current), reduced$rank == ncol(model.matrix(reduced)))
+            comparison <- anova(reduced, current)
+            fits[[term]] <- reduced
+            tests[[term]] <- tibble(language = lang, cue = cu, step = step, term = term, F = comparison$F[2], df = comparison$Df[2], 
+                p = comparison$`Pr(>F)`[2], AIC_current = AIC(current), AIC_reduced = AIC(reduced))
+        }
+        tests <- bind_rows(tests)
+        eligible <- filter(tests, p >= 0.05) %>% arrange(desc(p))
+        remove <- if (nrow(eligible)) 
+            eligible$term[1]
+        else ""
+        tests$removed <- tests$term == remove
+        comparison_rows[[paste(key, step)]] <- tests
+        if (!nzchar(remove)) 
+            break
+        current <- fits[[remove]]
+        active <- setdiff(active, remove)
+    }
+    stopifnot(all(c("condition2", "condition3", "condition4", "pre1_c", "pre2_c") %in% names(coef(current))), all(is.finite(vcov(current))))
+    wf_save(current, file.path(theory_dir, "models", paste0("RQ2_theory_selected_", key, ".rds")))
+    capture.output(summary(current), file = file.path(theory_dir, "models", paste0("RQ2_theory_selected_", key, 
+        "_summary.txt")))
+    selection_rows[[key]] <- tibble(language = lang, cue = cu, outcome = title, participants = nobs(current), excluded_incomplete = nrow(dd0) - 
+        nrow(dd), retained_interactions = if (length(active)) 
+        paste(active, collapse = "; ")
+    else "None", formula = paste(deparse(formula(current)), collapse = " "), R_squared = summary(current)$r.squared, 
+        residual_sd = sigma(current), max_Cooks_distance = max(cooks.distance(current)))
+    terms <- c(`(Intercept)` = "Intercept (least dense; mean pre-test AX)", condition2 = paste0(labels[[lang]][1], 
+        " dense (baseline: least dense)"), condition3 = paste0(labels[[lang]][2], " dense (baseline: least dense)"), 
+        condition4 = "Both dense (baseline: least dense)", pre1_c = paste(labels[[lang]][1], "pre-test AX"), pre2_c = paste(labels[[lang]][2], 
+            "pre-test AX"))
+    for (k in 2:4) for (j in 1:2) terms[paste0("condition", k, ":pre", j, "_c")] <- paste0(c(labels[[lang]][1], 
+        labels[[lang]][2], "Both")[k - 1], " dense × ", labels[[lang]][j], " pre-test AX\n(baseline: least-dense slope)")
+    cc <- as.data.frame(coef(summary(current)))
+    ci <- confint(current)
+    stopifnot(all(rownames(cc) %in% names(terms)))
+    coef_rows[[key]] <- tibble(language = lang, cue = cu, outcome = title, term = rownames(cc), label = unname(terms[rownames(cc)]), 
+        estimate = cc$Estimate, SE = cc$`Std. Error`, p = cc$`Pr(>|t|)`, lower = ci[, 1], upper = ci[, 2])
+    residual_rows[[key]] <- tibble(language = lang, cue = cu, participant = dd$participant, fitted = fitted(current), 
+        residual = residuals(current), standardized_residual = rstandard(current), Cooks_distance = cooks.distance(current))
+    data_rows[[key]] <- dd
+    for (co in as.character(1:4)) {
+        pred <- if (cu == "Cue1") 
+            "pre1_c"
+        else "pre2_c"
+        raw <- if (cu == "Cue1") 
+            "pre_Cue1"
+        else "pre_Cue2"
+        range <- range(dd[dd$condition == co, pred])
+        grid <- data.frame(condition = factor(rep(co, 80), levels = 1:4), pre1_c = 0, pre2_c = 0)
+        grid[[pred]] <- seq(range[1], range[2], length.out = 80)
+        pr <- predict(current, grid, interval = "confidence")
+        prediction_rows[[paste(key, co)]] <- tibble(language = lang, cue = cu, outcome = title, condition = co, 
+            pre = grid[[pred]] + mean(dd[[raw]]), estimate = pr[, "fit"], lower = pr[, "lwr"], upper = pr[, "upr"])
+    }
+}
+theory_selection <- bind_rows(selection_rows)
+theory_coef <- bind_rows(coef_rows)
+theory_predictions <- bind_rows(prediction_rows)
+theory_tests <- bind_rows(comparison_rows)
+theory_residuals <- bind_rows(residual_rows)
+stopifnot(nrow(theory_selection) == 6, nrow(theory_predictions) == 1920)
+write_csv(theory_selection, file.path(theory_dir, "rq2_theory_selection.csv"))
+write_csv(theory_coef, file.path(theory_dir, "rq2_theory_coefficients.csv"))
+write_csv(theory_predictions, file.path(theory_dir, "rq2_theory_predictions.csv"))
+write_csv(theory_tests, file.path(theory_dir, "rq2_theory_comparisons.csv"))
+write_csv(theory_residuals, file.path(theory_dir, "rq2_theory_residuals.csv"))
+write_csv(bind_rows(data_rows), file.path(theory_dir, "rq2_theory_model_data.csv"))
+```
+
+```{r theory-selection}
+wf_note("SECTION theory-selection")
+```
+
+```{r theory-model-output}
+wf_note("SECTION theory-model-output")
+for (lang in c("hindi", "korean", "mandarin")) for (cu in c("Cue1", "Cue2")) {
+}
+```
+
+```{r theory-diagnostics}
+wf_note("SECTION theory-diagnostics")
+rr <- theory_residuals %>% mutate(panel = paste(language, cue))
+```
+
+```{r rq3-posthoc-fit}
+wf_note("SECTION rq3-posthoc-fit")
+local({
+    posthoc_dir <- normalizePath(output_dir)
+    previous_dir <- getwd()
+    on.exit(setwd(previous_dir), add = TRUE)
+    setwd(posthoc_dir)
+    for (posthoc_outcome in c("overall", "Cue1", "Cue2")) {
+        library(lme4)
+        library(dplyr)
+        library(readr)
+        library(tidyr)
+        outcome <- posthoc_outcome
+        stopifnot(outcome %in% c("overall", "Cue1", "Cue2"))
+        d <- read_csv("rq3_model_data.csv", show_col_types = FALSE)
+        n_original <- nrow(d)
+        a <- read_csv("rq2_model_data.csv", show_col_types = FALSE)
+        stopifnot(!anyDuplicated(a[c("participant", "language", "cue")]))
+        pre <- a %>% select(participant, language, cue, pre) %>% pivot_wider(names_from = cue, values_from = pre, 
+            names_prefix = "pre_")
+        d <- left_join(d, pre, by = c("participant", "language"))
+        stopifnot(nrow(d) == n_original, all(is.finite(d$pre_Cue1)), all(is.finite(d$pre_Cue2)))
+        check <- d %>% distinct(participant, language, delta_Cue1, delta_Cue2) %>% pivot_longer(starts_with("delta_"), 
+            names_to = "cue", names_prefix = "delta_", values_to = "delta") %>% left_join(a %>% select(participant, 
+            language, cue, change, pre, post), by = c("participant", "language", "cue"))
+        stopifnot(all(abs(check$delta - check$change) < 1e-10), all(abs(check$post - check$pre - check$delta) < 
+            1e-10))
+        centers <- d %>% distinct(participant, language, pre_Cue1, pre_Cue2) %>% group_by(language) %>% summarise(pre1_center = mean(pre_Cue1), 
+            pre2_center = mean(pre_Cue2), .groups = "drop")
+        d <- left_join(d, centers, by = "language") %>% mutate(pre1_c = pre_Cue1 - pre1_center, pre2_c = pre_Cue2 - 
+            pre2_center, condition = factor(condition, levels = 1:4), participant = factor(participant), model_item = factor(model_item))
+        write_csv(d, paste0("rq3_posthoc_data_", outcome, ".csv"))
+        independent <- function(v) paste(c("(1|participant)", "(1|model_item)", if (length(v)) paste0("(0+", v, 
+            "|model_item)")), collapse = "+")
+        main <- "condition+overall_accuracy_c+pre1_c+delta1_c+pre2_c+delta2_c"
+        interactions <- c("condition:overall_accuracy_c", "pre1_c:delta1_c", "pre2_c:delta2_c")
+        fullfixed <- paste(c(main, interactions), collapse = "+")
+        rhs <- c(maximal_correlated = paste0("(1|participant)+(1+", fullfixed, "|model_item)"), main_slopes_correlated = paste0("(1|participant)+(1+", 
+            main, "|model_item)"), main_slopes_uncorrelated = independent(c("c2", "c3", "c4", "overall_accuracy_c", 
+            "pre1_c", "delta1_c", "pre2_c", "delta2_c")), condition_slopes_only = independent(c("c2", "c3", "c4")), 
+            accuracy_slope_only = independent("overall_accuracy_c"), ax_slopes_only = independent(c("pre1_c", "delta1_c", 
+                "pre2_c", "delta2_c")), ax1_slopes_only = independent(c("pre1_c", "delta1_c")), ax2_slopes_only = independent(c("pre2_c", 
+                "delta2_c")), pre_slopes_only = independent(c("pre1_c", "pre2_c")), change_slopes_only = independent(c("delta1_c", 
+                "delta2_c")), pre1_slope_only = independent("pre1_c"), pre2_slope_only = independent("pre2_c"), 
+            change1_slope_only = independent("delta1_c"), change2_slope_only = independent("delta2_c"), random_intercepts = independent(character()))
+        converged <- function(f) {
+            if (!inherits(f, "merMod")) 
+                return(FALSE)
+            msg <- f@optinfo$conv$lme4$messages
+            (is.null(f@optinfo$conv$opt) || all(f@optinfo$conv$opt == 0)) && length(msg[!grepl("boundary.*singular", 
+                msg)]) == 0
+        }
+        eligible <- function(f) converged(f) && !isSingular(f) && is.null(attr(getME(f, "X"), "col.dropped"))
+        fit_cached <- function(form, dd, key) {
+            wf_glmer(form, dd, legacy = file.path(legacy_model_dir, paste0("RQ3_posthoc_", key, ".rds")), optimizer = "nloptwrap")
+        }
+        all_candidates <- list()
+        all_selection <- list()
+        all_comparisons <- list()
+        for (lang in c("hindi", "korean", "mandarin")) {
+            dd <- droplevels(as.data.frame(filter(d, language == lang)))
+            dd$response <- dd[[switch(outcome, overall = "correct", Cue1 = "cue1_match", Cue2 = "cue2_match")]]
+            for (k in 2:4) dd[[paste0("c", k)]] <- as.numeric(dd$condition == as.character(k))
+            fits <- list()
+            records <- list()
+            for (nm in names(rhs)) {
+                wf_note("RQ3", lang, outcome, "candidate", nm)
+                f <- fit_cached(as.formula(paste("response~", fullfixed, "+", rhs[[nm]])), dd, paste(lang, outcome, 
+                  "candidate", nm, sep = "_"))
+                fits[[nm]] <- f
+                ok <- inherits(f, "merMod")
+                records[[nm]] <- tibble(language = lang, outcome = outcome, candidate = nm, converged = converged(f), 
+                  singular = if (ok) 
+                    isSingular(f)
+                  else NA, eligible = eligible(f), AIC = if (ok) 
+                    AIC(f)
+                  else NA_real_, BIC = if (ok) 
+                    BIC(f)
+                  else NA_real_, random_effects = rhs[[nm]], diagnostic = if (ok) 
+                    paste(f@optinfo$conv$lme4$messages, collapse = "; ")
+                  else conditionMessage(f))
+                write_csv(bind_rows(c(all_candidates, records)), paste0("rq3_posthoc_candidates_", outcome, ".csv"))
+            }
+            tab <- bind_rows(records)
+            stopifnot(any(tab$eligible))
+            best <- tab %>% filter(eligible) %>% slice_min(AIC, n = 1, with_ties = FALSE) %>% pull(candidate)
+            tab <- mutate(tab, selected = candidate == best)
+            all_candidates[[lang]] <- tab
+            current <- fits[[best]]
+            active <- interactions
+            step <- 0
+            comparison_rows <- list()
+            repeat {
+                step <- step + 1
+                trials <- list()
+                reduced_fits <- list()
+                if (!length(active)) 
+                  break
+                for (term in active) {
+                  wf_note("RQ3", lang, outcome, "interaction step", step, term)
+                  reduced_terms <- setdiff(active, term)
+                  f <- fit_cached(as.formula(paste("response~", paste(c(main, reduced_terms), collapse = "+"), 
+                    "+", rhs[[best]])), dd, paste(lang, outcome, "step", step, gsub(":", "_", term), sep = "_"))
+                  reduced_fits[[term]] <- f
+                  ok <- eligible(f)
+                  lr <- pv <- df <- NA_real_
+                  if (inherits(f, "merMod")) {
+                    stopifnot(identical(model.response(model.frame(f)), model.response(model.frame(current))), 
+                      nobs(f) == nobs(current))
+                    cmp <- as.data.frame(anova(f, current, test = "Chisq"))
+                    lr <- cmp$Chisq[2]
+                    pv <- cmp$`Pr(>Chisq)`[2]
+                    df <- cmp$Df[2]
+                    if (as.numeric(logLik(f)) > as.numeric(logLik(current)) + 1e-04) 
+                      ok <- FALSE
+                  }
+                  trials[[term]] <- tibble(language = lang, outcome = outcome, step = step, term = term, reduced_eligible = ok, 
+                    LR = lr, df = df, p = pv, AIC_current = AIC(current), AIC_reduced = if (inherits(f, "merMod")) 
+                      AIC(f)
+                    else NA_real_)
+                }
+                tests <- bind_rows(trials)
+                chosen <- if (nrow(remove)) 
+                  remove$term[1]
+                else ""
+                tests$removed <- tests$term == chosen
+                comparison_rows[[as.character(step)]] <- tests
+                if (!nzchar(chosen)) 
+                  break
+                current <- reduced_fits[[chosen]]
+                active <- setdiff(active, chosen)
+            }
+            stopifnot(eligible(current), all(c("condition2", "condition3", "condition4", "overall_accuracy_c", 
+                "pre1_c", "delta1_c", "pre2_c", "delta2_c") %in% names(fixef(current))))
+            wf_save(current, file.path("models", paste0("RQ3_posthoc_final_", lang, "_", outcome, ".rds")))
+            capture.output(summary(current), file = file.path("models", paste0("RQ3_posthoc_final_", lang, "_", 
+                outcome, "_summary.txt")))
+            all_comparisons[[lang]] <- bind_rows(comparison_rows)
+            all_selection[[lang]] <- tibble(language = lang, outcome = outcome, selected_random = best, participants = n_distinct(dd$participant), 
+                trials = nobs(current), converged = converged(current), singular = isSingular(current), retained_interactions = if (length(active)) 
+                  paste(active, collapse = "; ")
+                else "None", AIC = AIC(current), formula = paste(deparse(formula(current)), collapse = " "))
+            write_csv(bind_rows(all_candidates), paste0("rq3_posthoc_candidates_", outcome, ".csv"))
+            write_csv(bind_rows(all_selection), paste0("rq3_posthoc_selected_", outcome, ".csv"))
+            write_csv(bind_rows(all_comparisons), paste0("rq3_posthoc_interaction_tests_", outcome, ".csv"))
+            flush.console()
+        }
+    }
+})
+```
+
+```{r posthoc-setup}
+wf_note("SECTION posthoc-setup")
+library(lme4)
+library(dplyr)
+library(readr)
+library(ggplot2)
+ph_p <- normalizePath(output_dir)
+ph_labels <- list(hindi = c(Cue1 = "Aspiration", Cue2 = "Voicing"), korean = c(Cue1 = "Stop (b–bb)", Cue2 = "Coda (n–ng)"), 
+    mandarin = c(Cue1 = "Tone (1–3)", Cue2 = "Consonant (zh–j)"))
+ph_title <- function(lang, outcome) paste(tools::toTitleCase(lang), if (outcome == "overall") "Whole-word accuracy" else paste(ph_labels[[lang]][[outcome]], 
+    "accuracy"), sep = " — ")
+ph_selected <- bind_rows(lapply(c("overall", "Cue1", "Cue2"), function(o) read_csv(file.path(ph_p, paste0("rq3_posthoc_selected_", 
+    o, ".csv")), show_col_types = FALSE)))
+stopifnot(nrow(ph_selected) == 9, all(ph_selected$converged), !any(ph_selected$singular))
+ph_selected$model <- mapply(ph_title, ph_selected$language, ph_selected$outcome)
+ph_data <- read_csv(file.path(ph_p, "rq3_posthoc_data_overall.csv"), show_col_types = FALSE)
+ph_coef <- list()
+ph_pred <- list()
+for (o in c("overall", "Cue1", "Cue2")) for (lang in c("hindi", "korean", "mandarin")) {
+    f <- readRDS(file.path(ph_p, "models", paste0("RQ3_posthoc_final_", lang, "_", o, ".rds")))
+    cc <- as.data.frame(coef(summary(f)))
+    one <- ph_labels[[lang]][["Cue1"]]
+    two <- ph_labels[[lang]][["Cue2"]]
+    labels <- c(`(Intercept)` = "Intercept (least dense; mean predictors)", condition2 = paste0(one, " dense (baseline: least dense)"), 
+        condition3 = paste0(two, " dense (baseline: least dense)"), condition4 = "Both dense (baseline: least dense)", 
+        overall_accuracy_c = "Initial whole-word accuracy", pre1_c = paste(one, "pre-test AX"), delta1_c = paste(one, 
+            "AX change"), pre2_c = paste(two, "pre-test AX"), delta2_c = paste(two, "AX change"), `pre1_c:delta1_c` = paste(one, 
+            "pre-test AX × AX change"), `pre2_c:delta2_c` = paste(two, "pre-test AX × AX change"), `condition2:overall_accuracy_c` = paste0(one, 
+            " dense × initial accuracy\n(baseline: least-dense slope)"), `condition3:overall_accuracy_c` = paste0(two, 
+            " dense × initial accuracy\n(baseline: least-dense slope)"), `condition4:overall_accuracy_c` = "Both dense × initial accuracy\n(baseline: least-dense slope)")
+    stopifnot(all(rownames(cc) %in% names(labels)))
+    ph_coef[[paste(lang, o)]] <- tibble(language = lang, outcome = o, model = ph_title(lang, o), term = rownames(cc), 
+        label = unname(labels[rownames(cc)]), estimate = cc$Estimate, SE = cc$`Std. Error`, p = cc$`Pr(>|z|)`, 
+        lower = cc$Estimate - 1.96 * cc$`Std. Error`, upper = cc$Estimate + 1.96 * cc$`Std. Error`)
+    dd <- filter(ph_data, language == lang)
+    for (co in as.character(1:4)) {
+        people <- dd %>% filter(as.character(condition) == co) %>% distinct(participant, overall_accuracy_c)
+        grid <- data.frame(condition = factor(rep(co, 80), levels = as.character(1:4)), overall_accuracy_c = seq(min(people$overall_accuracy_c), 
+            max(people$overall_accuracy_c), length.out = 80), pre1_c = 0, delta1_c = 0, pre2_c = 0, delta2_c = 0)
+        xx <- model.matrix(delete.response(terms(nobars(formula(f)))), grid)
+        eta <- as.vector(xx %*% fixef(f))
+        se <- sqrt(rowSums((xx %*% vcov(f)) * xx))
+        ph_pred[[paste(lang, o, co)]] <- tibble(language = lang, outcome = o, model = ph_title(lang, o), condition = co, 
+            initial_accuracy = grid$overall_accuracy_c + dd$overall_accuracy_center[1], estimate = plogis(eta), 
+            lower = plogis(eta - 1.96 * se), upper = plogis(eta + 1.96 * se))
+    }
+}
+ph_coefficients <- bind_rows(ph_coef)
+ph_predictions <- bind_rows(ph_pred)
+stopifnot(nrow(ph_predictions) == 2880, all(is.finite(ph_predictions$estimate)))
+write_csv(ph_coefficients, file.path(ph_p, "rq3_posthoc_coefficients.csv"))
+write_csv(ph_predictions, file.path(ph_p, "rq3_posthoc_predictions.csv"))
+```
+
+```{r posthoc-table}
+wf_note("SECTION posthoc-table")
+```
+
+```{r posthoc-details}
+wf_note("SECTION posthoc-details")
+for (o in c("overall", "Cue1", "Cue2")) for (lang in c("hindi", "korean", "mandarin")) {
+    candidates <- read_csv(file.path(ph_p, paste0("rq3_posthoc_candidates_", o, ".csv")), show_col_types = FALSE)
+    tests <- read_csv(file.path(ph_p, paste0("rq3_posthoc_interaction_tests_", o, ".csv")), show_col_types = FALSE)
+}
+```
